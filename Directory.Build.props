@@ -5,7 +5,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <AccelerateBuildsInVisualStudio>true</AccelerateBuildsInVisualStudio>
-    <VersionPrefix>0.2.0</VersionPrefix>
+    <VersionPrefix>1.0.0</VersionPrefix>
     <Company>VisDir contributors</Company>
     <Product>VisDir</Product>
     <Copyright>Copyright © 2026 VisDir contributors</Copyright>

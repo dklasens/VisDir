@@ -15,6 +15,7 @@ using System.Windows.Threading;
 using Microsoft.Win32;
 using VisDir.App.Scan;
 using VisDir.App.Sunburst;
+using VisDir.App.Update;
 using VisDir.Core;
 
 namespace VisDir.App;
@@ -150,6 +151,8 @@ public partial class MainWindow : Window
         Focus();
         Topmost = true;
         Topmost = false;
+
+        _ = CheckForUpdatesAsync(silent: true);
 
         string[] args = Environment.GetCommandLineArgs();
         int scanIndex = Array.IndexOf(args, "--scan");
@@ -879,5 +882,173 @@ public partial class MainWindow : Window
 
     private static bool PathsEqual(string? left, string? right) => left is not null && right is not null &&
         string.Equals(left.TrimEnd('\\'), right.TrimEnd('\\'), StringComparison.OrdinalIgnoreCase);
+
+    // Auto-Updater State & Handlers
+    private readonly UpdateService _updateService = new();
+    private ReleaseInfo? _availableRelease;
+    private string? _downloadedZipPath;
+    private bool _isDownloadingUpdate;
+
+    private async Task CheckForUpdatesAsync(bool silent)
+    {
+        try
+        {
+            var release = await _updateService.CheckForUpdatesAsync().ConfigureAwait(true);
+            if (release is not null)
+            {
+                _availableRelease = release;
+                UpdateBadgeText.Text = $"Update {release.TagName} available";
+                UpdateBadgeButton.Visibility = Visibility.Visible;
+
+                if (!silent)
+                {
+                    ShowUpdateOverlay(release);
+                }
+            }
+            else if (!silent)
+            {
+                MessageBox.Show(
+                    this,
+                    $"You are using the latest version of VisDir (v{UpdateService.GetCurrentVersion()}).",
+                    "VisDir Up to Date",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Information);
+            }
+        }
+        catch (Exception ex)
+        {
+            if (!silent)
+            {
+                MessageBox.Show(
+                    this,
+                    $"Could not check for updates:\n{ex.Message}",
+                    "Update Check Failed",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Warning);
+            }
+        }
+    }
+
+    private void ShowUpdateOverlay(ReleaseInfo release)
+    {
+        UpdateTitleText.Text = $"Update Available: {release.TagName}";
+        UpdateVersionSubtitle.Text = $"Current: v{UpdateService.GetCurrentVersion()}  ·  New: {release.TagName}";
+        UpdateNotesText.Text = release.ReleaseNotes;
+        UpdateProgressPanel.Visibility = Visibility.Collapsed;
+        UpdateProgressBar.Value = 0;
+        UpdateActionButton.Content = "Download & Install";
+        UpdateActionButton.IsEnabled = true;
+        UpdateCancelButton.IsEnabled = true;
+        _downloadedZipPath = null;
+        _isDownloadingUpdate = false;
+        UpdateOverlay.Visibility = Visibility.Visible;
+    }
+
+    private void OnUpdateBadgeClick(object sender, RoutedEventArgs e)
+    {
+        if (_availableRelease is not null)
+        {
+            ShowUpdateOverlay(_availableRelease);
+        }
+        else
+        {
+            _ = CheckForUpdatesAsync(silent: false);
+        }
+    }
+
+    private void OnManualCheckUpdatesClick(object sender, RoutedEventArgs e)
+    {
+        _ = CheckForUpdatesAsync(silent: false);
+    }
+
+    private void OnCloseUpdateOverlayClick(object sender, RoutedEventArgs e)
+    {
+        if (_isDownloadingUpdate)
+        {
+            var result = MessageBox.Show(
+                this,
+                "A download is currently in progress. Do you want to cancel the update?",
+                "Cancel Update",
+                MessageBoxButton.YesNo,
+                MessageBoxImage.Question);
+            if (result != MessageBoxResult.Yes) return;
+        }
+        UpdateOverlay.Visibility = Visibility.Collapsed;
+    }
+
+    private void OnViewUpdateGitHubClick(object sender, RoutedEventArgs e)
+    {
+        string url = _availableRelease?.HtmlUrl ?? "https://github.com/dklasens/VisDir/releases";
+        try
+        {
+            Process.Start(new ProcessStartInfo(url) { UseShellExecute = true });
+        }
+        catch { }
+    }
+
+    private async void OnUpdateActionClick(object sender, RoutedEventArgs e)
+    {
+        if (_availableRelease is null) return;
+
+        // If already downloaded, apply and restart
+        if (!string.IsNullOrEmpty(_downloadedZipPath) && File.Exists(_downloadedZipPath))
+        {
+            try
+            {
+                UpdateService.ApplyUpdateAndRestart(_downloadedZipPath);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(
+                    this,
+                    $"Failed to apply update:\n{ex.Message}",
+                    "Update Error",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Error);
+            }
+            return;
+        }
+
+        // Otherwise, download update
+        _isDownloadingUpdate = true;
+        UpdateActionButton.IsEnabled = false;
+        UpdateCancelButton.IsEnabled = false;
+        UpdateProgressPanel.Visibility = Visibility.Visible;
+        UpdateProgressBar.Value = 0;
+        UpdateProgressText.Text = "Starting download…";
+
+        var progress = new Progress<(long BytesDownloaded, long TotalBytes, double Fraction)>(p =>
+        {
+            UpdateProgressBar.Value = p.Fraction;
+            string dl = SizeFormatter.Format((ulong)p.BytesDownloaded);
+            string tot = SizeFormatter.Format((ulong)p.TotalBytes);
+            UpdateProgressText.Text = $"Downloading: {dl} / {tot} ({p.Fraction:P0})";
+        });
+
+        try
+        {
+            string zip = await _updateService.DownloadUpdateAsync(_availableRelease, progress);
+            _downloadedZipPath = zip;
+            _isDownloadingUpdate = false;
+
+            UpdateProgressText.Text = "Download complete! Ready to install.";
+            UpdateActionButton.Content = "Restart to Apply";
+            UpdateActionButton.IsEnabled = true;
+            UpdateCancelButton.IsEnabled = true;
+        }
+        catch (Exception ex)
+        {
+            _isDownloadingUpdate = false;
+            UpdateActionButton.IsEnabled = true;
+            UpdateCancelButton.IsEnabled = true;
+            UpdateProgressText.Text = "Download failed.";
+            MessageBox.Show(
+                this,
+                $"Failed to download update:\n{ex.Message}",
+                "Update Download Error",
+                MessageBoxButton.OK,
+                MessageBoxImage.Error);
+        }
+    }
 }
 
