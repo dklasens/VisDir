@@ -41,19 +41,19 @@ jobs:
         shell: pwsh
         run: |
           $notes = @"
-          ## VisDir v1.0 Release 💽✨
+          ## VisDir v1.0 Release
 
-          A fast, beautiful, DaisyDisk-inspired disk space visualizer and analyzer for Windows.
+          A fast, modern disk space visualizer and analyzer for Windows, inspired by DaisyDisk.
 
-          ### ✨ Highlights
-          - 🌈 **Interactive GPU Sunburst**: Fluid SkiaSharp multi-ring chart with harmonic pastel palettes.
-          - ⚡ **WizTree-class NTFS MFT Engine**: Sub-second full-drive indexing via sequential Master File Table streaming.
-          - 🌐 **Multi-Threaded Compatible Engine**: Batch folder scanning supporting subfolders, USB drives (FAT32/exFAT), and network UNC paths.
-          - 🖱️ **Full Context Menu**: Right-click wedges or list items to reveal in Explorer or copy paths.
-          - 🔍 **Live Filtering & Capacity Gauges**: Search folders and explore proportional size bars in real-time.
-          - 🛡️ **Zero Telemetry**: Fully offline, private, and lightweight.
+          ### Highlights
+          - **Interactive GPU Sunburst**: Fluid SkiaSharp multi-ring chart with harmonic pastel palettes.
+          - **WizTree-class NTFS MFT Engine**: Sub-second full-drive indexing via sequential Master File Table streaming.
+          - **Multi-Threaded Compatible Engine**: Batch folder scanning supporting subfolders, USB drives (FAT32/exFAT), and network UNC paths.
+          - **Full Context Menu**: Right-click wedges or list items to reveal in Explorer or copy paths.
+          - **Live Filtering & Capacity Gauges**: Search folders and explore proportional size bars in real time.
+          - **Zero Telemetry**: Fully offline, private, and lightweight.
 
-          ### 📦 Installation
+          ### Installation
           Download and extract **``VisDir-win-x64.zip``** and launch **``VisDir.App.exe``**.
           "@
           Set-Content -Path "RELEASE_NOTES.md" -Value $notes -Encoding utf8
