@@ -1,0 +1,44 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <ItemGroup>
+    <ProjectReference Include="..\VisDir.Core\VisDir.Core.csproj" />
+    <ProjectReference Include="..\VisDir.Scanner\VisDir.Scanner.csproj"
+                      ReferenceOutputAssembly="false" Private="false" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="SkiaSharp.Views.WPF" Version="2.88.9" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UseWPF>true</UseWPF>
+    <ApplicationIcon>Assets\visdir-icon.ico</ApplicationIcon>
+    <RuntimeIdentifiers>win-x64;win-arm64</RuntimeIdentifiers>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Resource Include="Assets\visdir-icon.png" />
+  </ItemGroup>
+
+  <!-- Ship the scanner worker next to the app so ScanService can find it. -->
+  <Target Name="CopyScannerWorkerAfterBuild" AfterTargets="Build">
+    <ItemGroup>
+      <ScannerFiles Include="$(SolutionDir)src\VisDir.Scanner\bin\$(Configuration)\net8.0\**\*.*"
+                    Exclude="$(SolutionDir)src\VisDir.Scanner\bin\$(Configuration)\net8.0\refs\**;$(SolutionDir)src\VisDir.Scanner\bin\$(Configuration)\net8.0\*.pdb" />
+    </ItemGroup>
+    <Copy SourceFiles="@(ScannerFiles)" DestinationFolder="$(OutDir)Scanner\" SkipUnchangedFiles="true" />
+  </Target>
+
+  <Target Name="CopyScannerWorkerAfterPublish" AfterTargets="Publish">
+    <ItemGroup>
+      <ScannerPublishFiles Include="$(SolutionDir)src\VisDir.Scanner\bin\$(Configuration)\net8.0\**\*.*"
+                           Exclude="$(SolutionDir)src\VisDir.Scanner\bin\$(Configuration)\net8.0\refs\**;$(SolutionDir)src\VisDir.Scanner\bin\$(Configuration)\net8.0\*.pdb" />
+    </ItemGroup>
+    <Copy SourceFiles="@(ScannerPublishFiles)" DestinationFolder="$(PublishDir)Scanner\" SkipUnchangedFiles="true" />
+  </Target>
+
+</Project>

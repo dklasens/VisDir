@@ -1,0 +1,43 @@
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="VisDir"
+           Manufacturer="VisDir contributors"
+           Version="$(var.ProductVersion)"
+           UpgradeCode="6BFD82B2-686C-49E5-9CB2-F81676D04F98"
+           Scope="perMachine">
+    <SummaryInformation Description="Fast visual disk-space analyzer for Windows" />
+    <MajorUpgrade DowngradeErrorMessage="A newer version of VisDir is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+    <Icon Id="VisDirIcon" SourceFile="..\src\VisDir.App\Assets\visdir-icon.ico" />
+    <Property Id="ARPPRODUCTICON" Value="VisDirIcon" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="VisDir" />
+    </StandardDirectory>
+
+    <Feature Id="MainFeature" Title="VisDir" Level="1">
+      <ComponentGroupRef Id="PublishedFiles" />
+      <ComponentRef Id="StartMenuShortcut" />
+    </Feature>
+  </Package>
+
+  <Fragment>
+    <ComponentGroup Id="PublishedFiles" Directory="INSTALLFOLDER">
+      <Files Include="..\artifacts\publish\win-x64\**" />
+    </ComponentGroup>
+  </Fragment>
+
+  <Fragment>
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="ApplicationProgramsFolder" Name="VisDir">
+        <Component Id="StartMenuShortcut" Guid="9D972611-4ED1-4AA4-A6DD-E8EF133D645D">
+          <Shortcut Id="ApplicationStartMenuShortcut" Name="VisDir"
+                    Target="[INSTALLFOLDER]VisDir.App.exe" WorkingDirectory="INSTALLFOLDER"
+                    Icon="VisDirIcon" />
+          <RemoveFolder Id="ApplicationProgramsFolder" On="uninstall" />
+          <RegistryValue Root="HKLM" Key="Software\VisDir" Name="installed"
+                         Type="integer" Value="1" KeyPath="yes" />
+        </Component>
+      </Directory>
+    </StandardDirectory>
+  </Fragment>
+</Wix>

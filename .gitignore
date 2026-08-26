@@ -1,0 +1,26 @@
+# .NET / Visual Studio
+**/bin/
+**/obj/
+.vs/
+*.user
+*.suo
+*.pdb
+TestResults/
+
+# Publish and benchmark output
+artifacts/
+BenchmarkDotNet.Artifacts/
+*.vdir
+
+# Reference application dependencies
+squirreldisk-main/node_modules/
+squirreldisk-main/dist/
+squirreldisk-main/src-tauri/target/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.log
+debug.log
