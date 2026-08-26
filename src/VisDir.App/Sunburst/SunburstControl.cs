@@ -224,21 +224,21 @@ public class SunburstControl : SkiaSharp.Views.WPF.SKElement
     /// <summary>Chart geometry in pixels for a surface of the given size.</summary>
     private static (float cx, float cy, float radius, float inner, float band, float ringW) GeometryFor(float w, float h)
     {
-        float radius = MathF.Min(w, h) / 2f * 0.965f;
-        float inner = radius * (float)InnerRadiusFraction;
-        float band = (radius - inner) / MaxVisibleDepth;
-        float ringW = band - MathF.Max(2f, radius * 0.008f);
-        return (w / 2f, h / 2f, radius, inner, band, ringW);
+        float maxR = MathF.Min(w, h) / 2f * 0.88f;
+        float inner = maxR * (float)InnerRadiusFraction;
+        float band = (maxR - inner) / (MaxVisibleDepth + 1);
+        float ringW = band - MathF.Max(2.5f, maxR * 0.010f);
+        return (w / 2f, h / 2f, maxR, inner, band, ringW);
     }
 
     private (double radius, double inner, double band, double ringW) GeometryDip()
     {
         double w = Math.Max(ActualWidth, 1), h = Math.Max(ActualHeight, 1);
-        double radius = Math.Min(w, h) / 2 * 0.965;
-        double inner = radius * InnerRadiusFraction;
-        double band = (radius - inner) / MaxVisibleDepth;
-        double ringW = band - Math.Max(2, radius * 0.008);
-        return (radius, inner, band, ringW);
+        double maxR = Math.Min(w, h) / 2 * 0.88;
+        double inner = maxR * InnerRadiusFraction;
+        double band = (maxR - inner) / (MaxVisibleDepth + 1);
+        double ringW = band - Math.Max(2.5, maxR * 0.010);
+        return (maxR, inner, band, ringW);
     }
 
     private double RadiusFractionFromPoint(Point p)

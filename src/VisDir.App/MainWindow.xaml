@@ -239,13 +239,20 @@
                     <TextBlock Style="{StaticResource Dim}" FontSize="13.5" Margin="0,4,0,0" Text="Select a disk or folder to scan, or drag and drop any folder here."/>
                 </StackPanel>
 
-                <!-- Drive Cards Wrap Area -->
-                <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto">
-                    <ListBox x:Name="DriveCards" Background="Transparent" BorderThickness="0" SelectionChanged="OnDriveCardSelected" MouseDoubleClick="OnDriveCardDoubleClick">
-                        <ListBox.ItemsPanel><ItemsPanelTemplate><WrapPanel/></ItemsPanelTemplate></ListBox.ItemsPanel>
+                <!-- Drive Cards Grid Area -->
+                <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+                    <ListBox x:Name="DriveCards" Background="Transparent" BorderThickness="0"
+                             ScrollViewer.HorizontalScrollBarVisibility="Disabled"
+                             ScrollViewer.VerticalScrollBarVisibility="Disabled"
+                             SelectionChanged="OnDriveCardSelected" MouseDoubleClick="OnDriveCardDoubleClick">
+                        <ListBox.ItemsPanel>
+                            <ItemsPanelTemplate>
+                                <WrapPanel Orientation="Horizontal"/>
+                            </ItemsPanelTemplate>
+                        </ListBox.ItemsPanel>
                         <ListBox.ItemContainerStyle>
                             <Style TargetType="ListBoxItem" BasedOn="{StaticResource {x:Type ListBoxItem}}">
-                                <Setter Property="Width" Value="330"/>
+                                <Setter Property="Width" Value="340"/>
                                 <Setter Property="Margin" Value="0,0,16,16"/>
                                 <Setter Property="Cursor" Value="Hand"/>
                                 <Setter Property="ToolTip" Value="Double-click to scan this drive"/>
