@@ -3,7 +3,8 @@ param(
     [ValidateSet('win-x64', 'win-arm64')]
     [string] $Runtime = 'win-x64',
     [ValidateSet('Debug', 'Release')]
-    [string] $Configuration = 'Release'
+    [string] $Configuration = 'Release',
+    [switch] $NoRestore
 )
 
 $ErrorActionPreference = 'Stop'
@@ -20,36 +21,40 @@ if (Test-Path -LiteralPath $publishDir) {
 New-Item -ItemType Directory -Path $publishDir -Force | Out-Null
 
 $appProject = Join-Path $repoRoot 'src\VisDir.App\VisDir.App.csproj'
-$scannerProject = Join-Path $repoRoot 'src\VisDir.Scanner\VisDir.Scanner.csproj'
-$scannerDir = Join-Path $publishDir 'Scanner'
-
-dotnet publish $appProject -c $Configuration -r $Runtime --self-contained true `
-    -p:PublishReadyToRun=true -p:PublishSingleFile=false -p:DebugType=None `
-    -o $publishDir
+$publishArguments = @(
+    'publish', $appProject, '-c', $Configuration, '-r', $Runtime, '--self-contained', 'true',
+    '-p:PublishReadyToRun=true', '-p:PublishSingleFile=false', '-p:DebugType=None',
+    '-o', $publishDir
+)
+if ($NoRestore) { $publishArguments += '--no-restore' }
+dotnet @publishArguments
 if ($LASTEXITCODE -ne 0) { throw 'Application publish failed.' }
 
-dotnet publish $scannerProject -c $Configuration -r $Runtime --self-contained true `
-    -p:PublishReadyToRun=true -p:PublishSingleFile=false -p:DebugType=None `
-    -o $scannerDir
-if ($LASTEXITCODE -ne 0) { throw 'Scanner publish failed.' }
-
-$worker = Join-Path $scannerDir 'VisDir.Scanner.exe'
-if (-not (Test-Path -LiteralPath $worker)) { throw "Published worker is missing: $worker" }
+$workerAssembly = Join-Path $publishDir 'VisDir.Scanner.dll'
+if (-not (Test-Path -LiteralPath $workerAssembly)) { throw "Published worker assembly is missing: $workerAssembly" }
 
 $nativeSkia = Join-Path $publishDir "runtimes\$Runtime\native\libSkiaSharp.dll"
 if (Test-Path -LiteralPath $nativeSkia) {
     Copy-Item -LiteralPath $nativeSkia -Destination (Join-Path $publishDir 'libSkiaSharp.dll') -Force
 }
 
+$checksumName = "checksums-$Runtime.sha256"
 $checksums = Get-ChildItem -LiteralPath $publishDir -Recurse -File |
-    Where-Object Name -ne 'checksums.sha256' |
+    Where-Object Name -ne $checksumName |
     Sort-Object FullName |
     ForEach-Object {
         $hash = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
         $relative = $_.FullName.Substring($publishDir.Length).TrimStart('\', '/').Replace('\', '/')
         "$hash  $relative"
     }
-$checksums | Set-Content -LiteralPath (Join-Path $publishDir 'checksums.sha256') -Encoding utf8
+$checksums | Set-Content -LiteralPath (Join-Path $publishDir $checksumName) -Encoding utf8
+
+foreach ($line in Get-Content -LiteralPath (Join-Path $publishDir $checksumName)) {
+    $parts = $line -split '  ', 2
+    $filePath = Join-Path $publishDir $parts[1].Replace('/', '\')
+    $actual = (Get-FileHash -LiteralPath $filePath -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($actual -ne $parts[0]) { throw "Checksum verification failed for $($parts[1])" }
+}
 
 $zipPath = Join-Path $publishRoot "VisDir-$Runtime.zip"
 if (Test-Path -LiteralPath $zipPath) { Remove-Item -LiteralPath $zipPath -Force }

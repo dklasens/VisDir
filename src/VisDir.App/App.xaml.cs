@@ -2,6 +2,7 @@ using System.Configuration;
 using System.Data;
 using System.IO;
 using System.Windows;
+using VisDir.Scanner;
 
 namespace VisDir.App;
 
@@ -12,6 +13,14 @@ public partial class App : Application
 {
     protected override void OnStartup(StartupEventArgs e)
     {
+        if (e.Args is ["--worker", .. var workerArgs])
+        {
+            ShutdownMode = ShutdownMode.OnExplicitShutdown;
+            int exitCode = ScannerCli.Execute(workerArgs);
+            Shutdown(exitCode);
+            return;
+        }
+
         SafeLog($"[App] OnStartup at {DateTime.Now}");
         AppDomain.CurrentDomain.UnhandledException += (s, args) =>
         {
@@ -30,7 +39,14 @@ public partial class App : Application
         {
             string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "VisDir");
             Directory.CreateDirectory(dir);
-            File.AppendAllText(Path.Combine(dir, "debug.log"), $"{message}\n");
+            string logPath = Path.Combine(dir, "debug.log");
+            if (File.Exists(logPath) && new FileInfo(logPath).Length > 1_048_576)
+            {
+                string previous = logPath + ".1";
+                if (File.Exists(previous)) File.Delete(previous);
+                File.Move(logPath, previous);
+            }
+            File.AppendAllText(logPath, $"{DateTimeOffset.UtcNow:O} {message}{Environment.NewLine}");
         }
         catch
         {

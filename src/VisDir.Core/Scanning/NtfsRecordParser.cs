@@ -13,7 +13,7 @@ public struct MftEntryInfo
     public ulong ParentRecordNumber;
     public string Name = string.Empty;
     public bool HasPrimaryData;            // unnamed $DATA present
-    public bool PrimaryDataResident;       // allocated needs cluster rounding
+    public bool PrimaryDataResident;       // occupies the MFT record; no separate cluster allocation
     public ulong LogicalSize;              // from $DATA real/end-of-file
     public ulong DataAllocatedSize;        // from $DATA allocation (this record's instances)
     public ulong AdsAllocatedSize;         // named streams
@@ -197,7 +197,9 @@ public static unsafe class NtfsRecordParser
                     break;
 
                 case AttrIndexAllocation when nonResident && attrLen >= 0x40:
-                    info.IndexAllocationSize += *(ulong*)(rec + off + 0x28);
+                    // Size fields are valid only on the first extent record.
+                    if (*(ulong*)(rec + off + 0x10) == 0)
+                        info.IndexAllocationSize += *(ulong*)(rec + off + 0x28);
                     break;
             }
 
@@ -242,17 +244,29 @@ public static unsafe class NtfsRecordParser
             ulong valueLen = *(uint*)(rec + off + 0x10);
             if (named)
             {
-                info.AdsAllocatedSize += valueLen;
+                // Resident streams live inside the MFT record. The $MFT allocation is
+                // counted separately, so attributing bytes here would double-count them.
                 return;
             }
             info.HasPrimaryData = true;
             info.PrimaryDataResident = true;
             info.LogicalSize = Math.Max(info.LogicalSize, valueLen);
-            info.DataAllocatedSize += valueLen; // rounded to cluster by the scanner
             return;
         }
 
         if (attrLen < 0x40) return;
+        ulong lowestVcn = *(ulong*)(rec + off + 0x10);
+
+        // AllocatedLength/FileSize/ValidDataLength are undefined on continuation
+        // records. The lowest-VCN-zero record already describes the whole stream.
+        if (lowestVcn != 0)
+        {
+            if (!named) info.HasPrimaryData = true;
+            if ((attrFlags & 0x0001) != 0) info.Compressed = true;
+            if ((attrFlags & 0x8000) != 0) info.Sparse = true;
+            return;
+        }
+
         ulong alloc = *(ulong*)(rec + off + 0x28);
         ulong real = *(ulong*)(rec + off + 0x30);
 

@@ -1,6 +1,7 @@
 using System.IO;
 using System.Diagnostics;
 using System.Globalization;
+using System.Collections.Concurrent;
 using VisDir.Core;
 
 namespace VisDir.App.Scan;
@@ -13,6 +14,9 @@ public sealed class ScanService : IDisposable
 {
     private Process? _process;
     private string? _tempFile;
+    private int _scanSequence;
+    private int _activeScanId;
+    private readonly ConcurrentDictionary<int, byte> _cancelledScans = new();
 
     public event Action<double>? ProgressChanged;          // 0..1 estimate
     public event Action<string>? StatusChanged;
@@ -20,20 +24,28 @@ public sealed class ScanService : IDisposable
     public event Action<string>? Failed;
     public event Action? Cancelled;
 
-    private volatile bool _cancelRequested;
-
     public static bool WorkerAvailable =>
-        File.Exists(Path.Combine(AppContext.BaseDirectory, "Scanner", "VisDir.Scanner.exe"));
+        !string.IsNullOrWhiteSpace(Environment.ProcessPath) && File.Exists(Environment.ProcessPath);
 
     public bool IsScanning => _process is { HasExited: false };
 
     public void Start(string path, string mode = "auto")
     {
         if (IsScanning) return;
-        _cancelRequested = false;
+        if (!WorkerAvailable)
+        {
+            Failed?.Invoke("The VisDir scanner worker is missing from the application directory.");
+            return;
+        }
 
-        string exe = Path.Combine(AppContext.BaseDirectory, "Scanner", "VisDir.Scanner.exe");
-        _tempFile = Path.Combine(Path.GetTempPath(), $"visdir_{Guid.NewGuid():N}.vdir");
+        _process?.Dispose();
+        _process = null;
+        int scanId = Interlocked.Increment(ref _scanSequence);
+        Volatile.Write(ref _activeScanId, scanId);
+
+        string exe = Environment.ProcessPath!;
+        string tempFile = Path.Combine(Path.GetTempPath(), $"visdir_{Guid.NewGuid():N}.vdir");
+        _tempFile = tempFile;
 
         var psi = new ProcessStartInfo
         {
@@ -43,11 +55,12 @@ public sealed class ScanService : IDisposable
             RedirectStandardError = true,
             RedirectStandardOutput = true,
         };
+        psi.ArgumentList.Add("--worker");
         psi.ArgumentList.Add(path);
         psi.ArgumentList.Add("--mode");
         psi.ArgumentList.Add(mode);
         psi.ArgumentList.Add("--out");
-        psi.ArgumentList.Add(_tempFile);
+        psi.ArgumentList.Add(tempFile);
         psi.ArgumentList.Add("--top");
         psi.ArgumentList.Add("0");
 
@@ -58,20 +71,28 @@ public sealed class ScanService : IDisposable
         }
         catch (Exception ex)
         {
+            Volatile.Write(ref _activeScanId, 0);
+            TryDeleteTempFile(tempFile);
             Failed?.Invoke($"Failed to launch scanner: {ex.Message}");
             return;
         }
         if (_process is null)
         {
+            Volatile.Write(ref _activeScanId, 0);
+            TryDeleteTempFile(tempFile);
             Failed?.Invoke("Scanner failed to start.");
             return;
         }
 
         StatusChanged?.Invoke($"Scanning {path}…");
 
-        _process.ErrorDataReceived += (_, e) =>
+        Process process = _process;
+        string? workerError = null;
+        process.ErrorDataReceived += (_, e) =>
         {
             if (e.Data is null) return;
+            if (e.Data.StartsWith("ERROR:", StringComparison.Ordinal))
+                Interlocked.Exchange(ref workerError, e.Data[6..].Trim());
             if (e.Data.StartsWith("PROGRESS ", StringComparison.Ordinal))
             {
                 Dictionary<string, string> values = ParseValues(e.Data);
@@ -98,41 +119,54 @@ public sealed class ScanService : IDisposable
             }
         };
 
-        _process.EnableRaisingEvents = true;
-        _process.Exited += (_, _) =>
+        process.Exited += (_, _) =>
         {
             try
             {
-                if (_tempFile is not null && File.Exists(_tempFile))
+                bool wasCancelled = _cancelledScans.ContainsKey(scanId);
+                if (!wasCancelled && process.ExitCode == 0 && File.Exists(tempFile))
                 {
-                    using var fs = new FileStream(_tempFile, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 16,
+                    using var fs = new FileStream(tempFile, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 16,
                         FileOptions.DeleteOnClose);
                     ScanResult result = TreeSerializer.Read(fs);
                     Completed?.Invoke(result);
                 }
-                else if (_cancelRequested)
+                else if (wasCancelled)
                 {
                     // Deliberate cancellation: a calm, expected outcome — not an error.
                     Cancelled?.Invoke();
                 }
                 else
                 {
-                    Failed?.Invoke($"Scanner exited with code {_process.ExitCode}.");
+                    string? detail = Volatile.Read(ref workerError);
+                    Failed?.Invoke(string.IsNullOrWhiteSpace(detail)
+                        ? $"Scanner exited with code {process.ExitCode}."
+                        : $"Scanner failed: {detail}");
                 }
             }
             catch (Exception ex)
             {
                 Failed?.Invoke(ex.Message);
             }
+            finally
+            {
+                _cancelledScans.TryRemove(scanId, out _);
+                TryDeleteTempFile(tempFile);
+                if (Volatile.Read(ref _activeScanId) == scanId)
+                    Volatile.Write(ref _activeScanId, 0);
+            }
         };
 
-        _process.BeginErrorReadLine();
-        _process.BeginOutputReadLine();
+        // Attach the handler before enabling events so an immediately-exiting worker cannot be missed.
+        process.EnableRaisingEvents = true;
+        process.BeginErrorReadLine();
+        process.BeginOutputReadLine();
     }
 
     public void Cancel()
     {
-        _cancelRequested = true;
+        int scanId = Volatile.Read(ref _activeScanId);
+        if (scanId != 0) _cancelledScans.TryAdd(scanId, 0);
         try { if (_process is { HasExited: false } p) p.Kill(entireProcessTree: true); }
         catch { /* best effort */ }
     }
@@ -163,4 +197,10 @@ public sealed class ScanService : IDisposable
     private static double ParseDouble(IReadOnlyDictionary<string, string> values, string key, double fallback) =>
         values.TryGetValue(key, out string? raw) && double.TryParse(raw, NumberStyles.Float, CultureInfo.InvariantCulture, out double value)
             ? value : fallback;
+
+    private static void TryDeleteTempFile(string path)
+    {
+        try { if (File.Exists(path)) File.Delete(path); }
+        catch { /* best effort */ }
+    }
 }

@@ -261,7 +261,9 @@ public sealed class NtfsMftScanner : IDiskScanner
                     continue;
 
                 baseInfo.LogicalSize = Math.Max(baseInfo.LogicalSize, ext.LogicalSize);
-                baseInfo.DataAllocatedSize += ext.DataAllocatedSize;
+                // The lowest-VCN-zero record contains the complete primary-stream
+                // allocation. Never add continuation records to it.
+                baseInfo.DataAllocatedSize = Math.Max(baseInfo.DataAllocatedSize, ext.DataAllocatedSize);
                 baseInfo.AdsAllocatedSize += ext.AdsAllocatedSize;
                 baseInfo.IndexAllocationSize += ext.IndexAllocationSize;
                 baseInfo.Compressed |= ext.Compressed;
@@ -400,9 +402,9 @@ public sealed class NtfsMftScanner : IDiskScanner
         else
         {
             node.LogicalSize = e.LogicalSize;
-            node.AllocatedSize = e.PrimaryDataResident
-                ? MftMath.RoundToCluster(e.DataAllocatedSize, clusterSize) + e.AdsAllocatedSize
-                : e.DataAllocatedSize + e.AdsAllocatedSize;
+            // Resident streams occupy the MFT record and require no separate clusters;
+            // $MFT itself is represented in the tree and accounts for that storage.
+            node.AllocatedSize = e.DataAllocatedSize + e.AdsAllocatedSize;
 
             if (e.Compressed) node.Flags |= NodeFlags.Compressed;
             if (e.Sparse) node.Flags |= NodeFlags.SparseFile;

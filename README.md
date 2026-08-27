@@ -2,15 +2,15 @@
 
 > A fast, modern disk space visualizer and analyzer for Windows, inspired by DaisyDisk.
 
-Built with **C# (.NET 8)**, **WPF**, and **SkiaSharp** for GPU-accelerated harmonic sunburst rendering, paired with a WizTree-class **raw NTFS Master File Table ($MFT)** scanning engine.
+Built with **C# (.NET 10)**, **WPF**, and **SkiaSharp** for high-performance harmonic sunburst rendering, paired with a **raw NTFS Master File Table ($MFT)** scanning engine.
 
 ---
 
 ## Features
 
-- **Interactive Sunburst Visualization**: Real-time GPU-accelerated multi-ring sector rendering with harmonic palettes, center directory summaries, and smooth drill-down navigation.
+- **Interactive Sunburst Visualization**: Real-time multi-ring sector rendering with harmonic palettes, center directory summaries, and smooth drill-down navigation.
 - **Dual Scanning Engines**:
-  - **Fast NTFS (MFT Engine)**: Reads raw `$MFT` structures sequentially in 32 MiB streaming buffers for sub-second whole-drive indexing.
+  - **Fast NTFS (MFT Engine)**: Reads raw `$MFT` structures sequentially in 32 MiB streaming buffers for fast whole-drive indexing.
   - **Compatible Engine**: High-speed multi-threaded batch scanner (`GetFileInformationByHandleEx`) supporting subfolders, external drives (FAT32/exFAT), and network UNC paths.
 - **Explorer & Shell Integration**:
   - Right-click any sector on the sunburst or item in the contents list to instantly **Reveal in File Explorer** or **Copy Full Path**.
@@ -19,7 +19,7 @@ Built with **C# (.NET 8)**, **WPF**, and **SkiaSharp** for GPU-accelerated harmo
   - Accounts for physical cluster rounding, resident `$DATA`, and Alternate Data Streams (ADS).
   - Reparse point and directory junction loop protection.
   - Cloud-filter awareness (zeroes non-resident OneDrive placeholders to reflect true physical disk occupancy).
-- **Privacy & Performance**: Fully offline, zero telemetry, zero analytics, and low memory footprint.
+- **Privacy & Performance**: Zero telemetry and analytics. VisDir only connects to GitHub to check for updates, and otherwise processes scan data locally.
 
 ---
 
@@ -27,9 +27,9 @@ Built with **C# (.NET 8)**, **WPF**, and **SkiaSharp** for GPU-accelerated harmo
 
 Download standalone self-contained packages from the [Releases](https://github.com/dklasens/VisDir/releases) page:
 
-1. Download **`VisDir-win-x64.zip`** (or `VisDir-win-arm64.zip` for ARM devices).
-2. Extract the archive.
-3. Run **`VisDir.App.exe`**.
+1. Download **`VisDir-win-x64.zip`** (or `VisDir-win-arm64.zip` for ARM devices), or use the x64 MSI installer.
+2. If using a ZIP, extract the archive.
+3. Run **`VisDir.App.exe`** (the MSI adds a Start menu shortcut).
 
 > **Note**: To use the instant **Fast NTFS ($MFT)** engine on whole drives, launch VisDir as Administrator. When run as a standard user, VisDir automatically uses the multi-threaded Compatible engine.
 
@@ -53,7 +53,7 @@ Download standalone self-contained packages from the [Releases](https://github.c
 ## Building from Source
 
 ### Prerequisites
-- [.NET 8.0 SDK](https://dotnet.microsoft.com/download/dotnet/8.0) (8.0.400 or later)
+- [.NET 10.0 SDK](https://dotnet.microsoft.com/download/dotnet/10.0) (10.0.400 or later)
 - Windows 10/11 (x64 or ARM64)
 
 ### Build & Run
@@ -83,7 +83,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\publish.ps1 -Runtime win-x64
 
 - **`src/VisDir.Core`**: Core filesystem data models (`FsNode`), snapshot serializer (`TreeSerializer`), and scanning engines (`NtfsMftScanner`, `GenericScanner`).
 - **`src/VisDir.App`**: WPF UI application containing the SkiaSharp sunburst canvas (`SunburstControl`), history navigation, search filters, and dark-themed styles.
-- **`src/VisDir.Scanner`**: Standalone CLI worker executable for isolated, elevated scanning and benchmarking.
+- **`src/VisDir.Scanner`**: Scanner worker library hosted by `VisDir.App.exe --worker`, avoiding a second bundled runtime and executable.
 - **`benchmarks/VisDir.Benchmarks`**: Synthetic and drive throughput benchmarking tools.
 - **`tests/VisDir.Core.Tests`**: Test suite covering record parsing, tree aggregation, serialization, and geometry.
 

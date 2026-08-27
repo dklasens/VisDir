@@ -1,7 +1,11 @@
 using System.IO;
+using System.IO.Compression;
+using System.Diagnostics;
+using System.Security.Cryptography;
 using VisDir.Core;
 using VisDir.Core.Scanning;
 using VisDir.App.Sunburst;
+using VisDir.App.Update;
 using Xunit;
 
 namespace VisDir.Core.Tests;
@@ -235,6 +239,14 @@ public class SunburstLayoutTests
 public class ScannerTests
 {
     [Fact]
+    public void NormalizeScanRoot_ResolvesRelativePaths()
+    {
+        string normalized = PathUtils.NormalizeScanRoot(".");
+        Assert.True(Path.IsPathFullyQualified(normalized));
+        Assert.Equal(Path.GetFullPath(".").TrimEnd('\\', '/'), normalized);
+    }
+
+    [Fact]
     public void GenericScanner_CountsDirectoriesOnce()
     {
         string root = Path.Combine(Path.GetTempPath(), $"visdir_test_{Guid.NewGuid():N}");
@@ -273,10 +285,208 @@ public class ScannerTests
         }
     }
 
+    [Fact]
+    public unsafe void NtfsParser_ResidentDataHasLogicalButNoSeparateAllocation()
+    {
+        byte[] record = MakeDataRecord(nonResident: false, valueOrAllocated: 137, lowestVcn: 0);
+        fixed (byte* pointer = record)
+        {
+            Assert.True(NtfsRecordParser.TryParseRecord(pointer, record.Length, out MftEntryInfo info));
+            Assert.True(info.PrimaryDataResident);
+            Assert.Equal(137UL, info.LogicalSize);
+            Assert.Equal(0UL, info.DataAllocatedSize);
+        }
+    }
+
+    [Fact]
+    public unsafe void NtfsParser_IgnoresUndefinedSizesOnContinuationExtent()
+    {
+        byte[] record = MakeDataRecord(nonResident: true, valueOrAllocated: 0x1234_5000, lowestVcn: 42);
+        fixed (byte* pointer = record)
+        {
+            Assert.True(NtfsRecordParser.TryParseRecord(pointer, record.Length, out MftEntryInfo info));
+            Assert.True(info.HasPrimaryData);
+            Assert.Equal(0UL, info.LogicalSize);
+            Assert.Equal(0UL, info.DataAllocatedSize);
+        }
+    }
+
+    private static byte[] MakeDataRecord(bool nonResident, ulong valueOrAllocated, ulong lowestVcn)
+    {
+        byte[] record = new byte[1024];
+        "FILE"u8.CopyTo(record);
+        BitConverter.GetBytes((ushort)0x30).CopyTo(record, 4); // USA offset
+        BitConverter.GetBytes((ushort)3).CopyTo(record, 6);   // two sectors + sequence
+        BitConverter.GetBytes((ushort)0x38).CopyTo(record, 0x14);
+        BitConverter.GetBytes((ushort)0x0001).CopyTo(record, 0x16); // in use
+        BitConverter.GetBytes((uint)123).CopyTo(record, 0x2C);
+
+        const ushort sequence = 0xA55A;
+        BitConverter.GetBytes(sequence).CopyTo(record, 0x30);
+        BitConverter.GetBytes((ushort)0).CopyTo(record, 0x32);
+        BitConverter.GetBytes((ushort)0).CopyTo(record, 0x34);
+        BitConverter.GetBytes(sequence).CopyTo(record, 510);
+        BitConverter.GetBytes(sequence).CopyTo(record, 1022);
+
+        const int attr = 0x38;
+        BitConverter.GetBytes(0x80u).CopyTo(record, attr); // $DATA
+        record[attr + 8] = nonResident ? (byte)1 : (byte)0;
+
+        int attrLength;
+        if (nonResident)
+        {
+            attrLength = 0x48;
+            BitConverter.GetBytes(lowestVcn).CopyTo(record, attr + 0x10);
+            BitConverter.GetBytes(lowestVcn + 1).CopyTo(record, attr + 0x18);
+            BitConverter.GetBytes(valueOrAllocated).CopyTo(record, attr + 0x28);
+            BitConverter.GetBytes(valueOrAllocated / 2).CopyTo(record, attr + 0x30);
+        }
+        else
+        {
+            attrLength = 0xA8;
+            BitConverter.GetBytes((uint)valueOrAllocated).CopyTo(record, attr + 0x10);
+            BitConverter.GetBytes((ushort)0x18).CopyTo(record, attr + 0x14);
+        }
+
+        BitConverter.GetBytes((uint)attrLength).CopyTo(record, attr + 4);
+        int end = attr + attrLength;
+        BitConverter.GetBytes(0xFFFF_FFFFu).CopyTo(record, end);
+        BitConverter.GetBytes((uint)(end + 8)).CopyTo(record, 0x18);
+        return record;
+    }
+
     [Theory]
     [InlineData(0UL, 4096U, 0UL)]
     [InlineData(1UL, 4096U, 4096UL)]
     [InlineData(4097UL, 4096U, 8192UL)]
     public void MftMath_RoundsToClusters(ulong value, uint cluster, ulong expected) =>
         Assert.Equal(expected, MftMath.RoundToCluster(value, cluster));
+}
+
+public class UpdateServiceTests
+{
+    [Fact]
+    public void UpdateHelper_HasValidPowerShellSyntax()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        string script = Path.Combine(Path.GetTempPath(), $"visdir_update_parser_{Guid.NewGuid():N}.ps1");
+        try
+        {
+            File.WriteAllText(script, UpdateService.UpdateScriptForTests);
+            var startInfo = new ProcessStartInfo
+            {
+                FileName = "powershell.exe",
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                CreateNoWindow = true,
+            };
+            startInfo.Environment["VISDIR_SCRIPT_TO_PARSE"] = script;
+            startInfo.ArgumentList.Add("-NoProfile");
+            startInfo.ArgumentList.Add("-NonInteractive");
+            startInfo.ArgumentList.Add("-Command");
+            startInfo.ArgumentList.Add(
+                "$tokens=$null;$errors=$null;[void][System.Management.Automation.Language.Parser]::ParseFile($env:VISDIR_SCRIPT_TO_PARSE,[ref]$tokens,[ref]$errors);if($errors.Count){$errors|ForEach-Object{Write-Error $_};exit 1}");
+
+            using Process process = Process.Start(startInfo)!;
+            string stdout = process.StandardOutput.ReadToEnd();
+            string stderr = process.StandardError.ReadToEnd();
+            Assert.True(process.WaitForExit(15_000), "PowerShell parser timed out.");
+            Assert.True(process.ExitCode == 0, $"PowerShell syntax errors:{Environment.NewLine}{stdout}{stderr}");
+        }
+        finally { File.Delete(script); }
+    }
+
+    [Fact]
+    public void NormalizeDigest_AcceptsGitHubFormatAndRejectsMissingDigest()
+    {
+        string hex = new('a', 64);
+        Assert.Equal(hex, UpdateService.NormalizeDigest("sha256:" + hex.ToUpperInvariant()));
+        Assert.Throws<InvalidDataException>(() => UpdateService.NormalizeDigest(null));
+    }
+
+    [Fact]
+    public void VerifyFileDigest_DetectsTampering()
+    {
+        string file = Path.GetTempFileName();
+        try
+        {
+            File.WriteAllText(file, "verified payload");
+            string digest = Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(file))).ToLowerInvariant();
+            UpdateService.VerifyFileDigest(file, digest);
+            File.AppendAllText(file, "tampered");
+            Assert.Throws<InvalidDataException>(() => UpdateService.VerifyFileDigest(file, digest));
+        }
+        finally { File.Delete(file); }
+    }
+
+    [Fact]
+    public void ExtractUpdateArchive_RejectsSiblingTraversal()
+    {
+        string root = Path.Combine(Path.GetTempPath(), $"visdir_update_test_{Guid.NewGuid():N}");
+        Directory.CreateDirectory(root);
+        string zip = Path.Combine(root, "bad.zip");
+        string staging = Path.Combine(root, "Staged");
+        try
+        {
+            using (var archive = ZipFile.Open(zip, ZipArchiveMode.Create))
+                archive.CreateEntry("../StagedEvil/payload.exe");
+            Assert.Throws<InvalidDataException>(() => UpdateService.ExtractUpdateArchive(zip, staging));
+            Assert.False(File.Exists(Path.Combine(root, "StagedEvil", "payload.exe")));
+        }
+        finally { Directory.Delete(root, recursive: true); }
+    }
+
+    [Fact]
+    public void ExtractUpdateArchive_RequiresAndExtractsExpectedExecutables()
+    {
+        string root = Path.Combine(Path.GetTempPath(), $"visdir_update_test_{Guid.NewGuid():N}");
+        Directory.CreateDirectory(root);
+        string zip = Path.Combine(root, "good.zip");
+        string staging = Path.Combine(root, "Staged");
+        try
+        {
+            using (var archive = ZipFile.Open(zip, ZipArchiveMode.Create))
+            {
+                WriteEntry(archive, "VisDir.App.exe", "app");
+                WriteEntry(archive, "VisDir.Scanner.dll", "scanner");
+            }
+            string extracted = UpdateService.ExtractUpdateArchive(zip, staging);
+            Assert.Equal("app", File.ReadAllText(Path.Combine(extracted, "VisDir.App.exe")));
+            Assert.Equal("scanner", File.ReadAllText(Path.Combine(extracted, "VisDir.Scanner.dll")));
+        }
+        finally { Directory.Delete(root, recursive: true); }
+    }
+
+    [Fact]
+    public void ExtractUpdateArchive_RejectsDuplicateAndAlternateDataStreamPaths()
+    {
+        string root = Path.Combine(Path.GetTempPath(), $"visdir_update_test_{Guid.NewGuid():N}");
+        Directory.CreateDirectory(root);
+        try
+        {
+            string duplicateZip = Path.Combine(root, "duplicate.zip");
+            using (var archive = ZipFile.Open(duplicateZip, ZipArchiveMode.Create))
+            {
+                WriteEntry(archive, "VisDir.App.exe", "first");
+                WriteEntry(archive, "VisDir.App.exe", "second");
+            }
+            Assert.Throws<InvalidDataException>(() =>
+                UpdateService.ExtractUpdateArchive(duplicateZip, Path.Combine(root, "DuplicateStaging")));
+
+            string adsZip = Path.Combine(root, "ads.zip");
+            using (var archive = ZipFile.Open(adsZip, ZipArchiveMode.Create))
+                WriteEntry(archive, "VisDir.App.exe:payload", "unsafe");
+            Assert.Throws<InvalidDataException>(() =>
+                UpdateService.ExtractUpdateArchive(adsZip, Path.Combine(root, "AdsStaging")));
+        }
+        finally { Directory.Delete(root, recursive: true); }
+    }
+
+    private static void WriteEntry(ZipArchive archive, string name, string content)
+    {
+        using Stream stream = archive.CreateEntry(name).Open();
+        using var writer = new StreamWriter(stream);
+        writer.Write(content);
+    }
 }

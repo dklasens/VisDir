@@ -130,6 +130,12 @@ public sealed class GenericScanner : IDiskScanner
                 $"Scan aborted: directory count exceeded safety limit ({MaxDirsSafetyLimit:N0}). " +
                 "This indicates an engine defect — please report with VISDIR_TRACE_ERRORS=1 output.");
 
+        if (root.Children is { Count: 1 } rootChildren &&
+            (rootChildren[0].Flags & (NodeFlags.AccessDenied | NodeFlags.ErrorNode)) != 0)
+        {
+            throw new IOException($"The scan root could not be read: {volume.RootPath}");
+        }
+
         if (TraceErrors && !_errorCounts.IsEmpty)
         {
             foreach (var kv in _errorCounts.OrderByDescending(k => k.Value).Take(20))
@@ -344,6 +350,10 @@ public sealed class GenericScanner : IDiskScanner
 
         var result = new List<FsNode>(128);
         byte[] buf = _buffer.Value ??= new byte[InitialBufferSize];
+        // Capture the information class for this handle. A different worker may
+        // discover a volume-wide downgrade while this directory is in flight; it
+        // must not make us switch record layouts halfway through one enumeration.
+        bool useExtd = extdRequested && Volatile.Read(ref _useExtdClass);
 
         try
         {
@@ -351,10 +361,6 @@ public sealed class GenericScanner : IDiskScanner
             {
                 ct.ThrowIfCancellationRequested();
                 if (_braked) throw new OperationCanceledException();
-
-                // Capability downgrade is global (volume genuinely lacks the class);
-                // shape-mismatch retry is per-directory (see Enumerate).
-                bool useExtd = extdRequested && _useExtdClass;
 
                 bool ok;
                 fixed (byte* p = buf)
@@ -375,7 +381,7 @@ public sealed class GenericScanner : IDiskScanner
                         // Restart this directory under the fallback layout — never mix classes
                         // on one handle (enumeration position semantics differ per class).
                         // finally-block closes the handle; wrapper restarts cleanly.
-                        _useExtdClass = false;
+                        Volatile.Write(ref _useExtdClass, false);
                         throw new CapabilityDowngradeException();
                     }
                     if (err == NativeMethods.ERROR_ACCESS_DENIED)

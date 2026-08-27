@@ -8,9 +8,10 @@ using VisDir.Core.Scanning;
 namespace VisDir.Scanner;
 
 [SupportedOSPlatform("windows")]
-internal static class Program
+public static class ScannerCli
 {
-    private static int Main(string[] args)
+    /// <summary>Runs the scanner command line inside the WPF application's isolated worker mode.</summary>
+    public static int Execute(string[] args)
     {
         try
         {
@@ -432,7 +433,7 @@ internal static class Program
     private static void PrintUsage()
     {
         Console.Error.WriteLine("""
-            VisDir.Scanner � disk usage scanner
+            VisDir.Scanner — disk usage scanner
             Usage:
               VisDir.Scanner <path> [--out <file.vdir>] [--report] [--top N] [--threads N]
 

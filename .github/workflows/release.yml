@@ -5,6 +5,11 @@ on:
     tags:
       - 'v*'
   workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing v-prefixed release tag (for example v1.1.0)'
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -12,16 +17,30 @@ permissions:
 jobs:
   build-and-release:
     runs-on: windows-latest
+    env:
+      CI: true
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
 
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: '8.0.x'
+          dotnet-version: '10.0.x'
 
       - name: Restore dependencies
         run: dotnet restore VisDir.sln
+
+      - name: Validate release tag and project version
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+        run: |
+          $version = (dotnet msbuild src/VisDir.App/VisDir.App.csproj -getProperty:Version -nologo).Trim()
+          if ($env:RELEASE_TAG -ne "v$version") {
+            throw "Release tag $env:RELEASE_TAG does not match project version v$version"
+          }
 
       - name: Run Tests
         run: dotnet test VisDir.sln -c Release --no-restore
@@ -36,36 +55,23 @@ jobs:
         run: |
           ./scripts/publish.ps1 -Runtime win-arm64 -Configuration Release
 
-      - name: Generate Release Notes
-        id: release_notes
+      - name: Install WiX v6
+        run: dotnet tool install --global wix --version 6.*
+
+      - name: Build x64 MSI
         shell: pwsh
-        run: |
-          $notes = @"
-          ## VisDir v1.0 Release
-
-          A fast, modern disk space visualizer and analyzer for Windows, inspired by DaisyDisk.
-
-          ### Highlights
-          - **Interactive GPU Sunburst**: Fluid SkiaSharp multi-ring chart with harmonic pastel palettes.
-          - **WizTree-class NTFS MFT Engine**: Sub-second full-drive indexing via sequential Master File Table streaming.
-          - **Multi-Threaded Compatible Engine**: Batch folder scanning supporting subfolders, USB drives (FAT32/exFAT), and network UNC paths.
-          - **Full Context Menu**: Right-click wedges or list items to reveal in Explorer or copy paths.
-          - **Live Filtering & Capacity Gauges**: Search folders and explore proportional size bars in real time.
-          - **Zero Telemetry**: Fully offline, private, and lightweight.
-
-          ### Installation
-          Download and extract **``VisDir-win-x64.zip``** and launch **``VisDir.App.exe``**.
-          "@
-          Set-Content -Path "RELEASE_NOTES.md" -Value $notes -Encoding utf8
+        run: ./installer/build.ps1 -SkipPublish
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          body_path: RELEASE_NOTES.md
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+          generate_release_notes: true
           draft: false
           prerelease: false
           files: |
             artifacts/publish/VisDir-win-x64.zip
             artifacts/publish/VisDir-win-arm64.zip
-            artifacts/publish/win-x64/checksums.sha256
-            artifacts/publish/win-arm64/checksums.sha256
+            artifacts/publish/win-x64/checksums-win-x64.sha256
+            artifacts/publish/win-arm64/checksums-win-arm64.sha256
+            artifacts/installer/*.msi

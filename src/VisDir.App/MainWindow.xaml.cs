@@ -69,6 +69,8 @@ public partial class MainWindow : Window
     public MainWindow()
     {
         InitializeComponent();
+        ApplySystemContrast();
+        SystemParameters.StaticPropertyChanged += OnSystemParametersChanged;
         SourceInitialized += (_, _) => EnableDarkTitleBar();
         RefreshDrives();
 
@@ -132,11 +134,55 @@ public partial class MainWindow : Window
 
         Closed += (_, _) =>
         {
+            SystemParameters.StaticPropertyChanged -= OnSystemParametersChanged;
             _driveRefreshTimer.Stop();
+            _updateDownloadCts?.Cancel();
+            _updateDownloadCts?.Dispose();
             _scanner.Dispose();
         };
 
         Loaded += OnLoaded;
+    }
+
+    private void OnSystemParametersChanged(object? sender, PropertyChangedEventArgs e)
+    {
+        if (e.PropertyName is nameof(SystemParameters.HighContrast) or nameof(SystemParameters.WindowGlassColor))
+        {
+            ApplySystemContrast();
+            EnableDarkTitleBar();
+            Burst.InvalidateVisual();
+            if (_viewRoot is not null) RebuildFileList();
+        }
+    }
+
+    private void ApplySystemContrast()
+    {
+        bool highContrast = SystemParameters.HighContrast;
+        SetResourceBrush("WindowBgBrush", highContrast ? SystemColors.WindowColor : Color.FromRgb(0x22, 0x26, 0x38));
+        SetResourceBrush("PanelBrush", highContrast ? SystemColors.WindowColor : Color.FromRgb(0x1D, 0x20, 0x2E));
+        SetResourceBrush("CardBrush", highContrast ? SystemColors.WindowColor : Color.FromRgb(0x28, 0x2D, 0x40));
+        SetResourceBrush("BorderBrush", highContrast ? SystemColors.WindowTextColor : Color.FromRgb(0x34, 0x3B, 0x52));
+        SetResourceBrush("TextBrush", highContrast ? SystemColors.WindowTextColor : Color.FromRgb(0xF4, 0xF5, 0xF9));
+        SetResourceBrush("DimBrush", highContrast ? SystemColors.WindowTextColor : Color.FromRgb(0x8E, 0x95, 0xAA));
+        SetResourceBrush("AccentGreenBrush", highContrast ? SystemColors.HighlightColor : Color.FromRgb(0x5C, 0xD6, 0x8D));
+        SetResourceBrush("AccentBlueBrush", highContrast ? SystemColors.HighlightColor : Color.FromRgb(0x4E, 0x75, 0xDB));
+        SetResourceBrush("DeleteRedBrush", highContrast ? SystemColors.HighlightColor : Color.FromRgb(0xB3, 0x39, 0x42));
+        SetResourceBrush("DockBgBrush", highContrast ? SystemColors.WindowColor : Color.FromRgb(0x18, 0x1B, 0x27));
+        SetResourceBrush("SurfaceBrush", highContrast ? SystemColors.WindowColor : Color.FromRgb(0x2C, 0x33, 0x47));
+        SetResourceBrush("InputBrush", highContrast ? SystemColors.WindowColor : Color.FromRgb(0x25, 0x2A, 0x3D));
+        SetResourceBrush("ProgressTrackBrush", highContrast ? SystemColors.WindowColor : Color.FromRgb(0x38, 0x40, 0x58));
+        SetResourceBrush("OverlayBrush", highContrast ? SystemColors.WindowColor : Color.FromArgb(0xEA, 0x22, 0x26, 0x38));
+        SetResourceBrush("AccentTextBrush", highContrast ? SystemColors.HighlightTextColor : Colors.White);
+        Background = (Brush)FindResource("WindowBgBrush");
+        Foreground = (Brush)FindResource("TextBrush");
+    }
+
+    private void SetResourceBrush(string key, Color color)
+    {
+        if (Resources[key] is SolidColorBrush brush && !brush.IsFrozen)
+            brush.Color = color;
+        else
+            Resources[key] = new SolidColorBrush(color);
     }
 
     private void OnLoaded(object sender, RoutedEventArgs e)
@@ -151,6 +197,9 @@ public partial class MainWindow : Window
         Focus();
         Topmost = true;
         Topmost = false;
+
+        // The transactional updater waits for this signal before deleting its rollback copy.
+        UpdateService.ReportHealthyStart();
 
         _ = CheckForUpdatesAsync(silent: true);
 
@@ -169,6 +218,15 @@ public partial class MainWindow : Window
         {
             IntPtr handle = new WindowInteropHelper(this).Handle;
             if (handle == IntPtr.Zero) return;
+            if (SystemParameters.HighContrast)
+            {
+                int disabled = 0;
+                DwmSetWindowAttribute(handle, 20, ref disabled, sizeof(int));
+                int defaultColor = -1;
+                DwmSetWindowAttribute(handle, 35, ref defaultColor, sizeof(int));
+                DwmSetWindowAttribute(handle, 36, ref defaultColor, sizeof(int));
+                return;
+            }
             int enabled = 1;
             if (DwmSetWindowAttribute(handle, 20, ref enabled, sizeof(int)) != 0)
                 DwmSetWindowAttribute(handle, 19, ref enabled, sizeof(int));
@@ -230,6 +288,7 @@ public partial class MainWindow : Window
         LandingPanel.Visibility = Visibility.Visible;
         ContentShell.Visibility = Visibility.Collapsed;
         EngineBadge.Visibility = Visibility.Collapsed;
+        ScanWarningBadge.Visibility = Visibility.Collapsed;
         RescanButton.Visibility = Visibility.Collapsed;
         BreadcrumbBar.Children.Clear();
         DisksRootButton.IsEnabled = false;
@@ -308,6 +367,7 @@ public partial class MainWindow : Window
         LandingPanel.Visibility = Visibility.Collapsed;
         ContentShell.Visibility = Visibility.Visible;
         ScanOverlay.Visibility = Visibility.Visible;
+        ScanWarningBadge.Visibility = Visibility.Collapsed;
         ScanOverlayTarget.Text = path;
         ScanProgressBar.IsIndeterminate = true;
         ScanPhaseText.Text = "Initializing scan…";
@@ -353,6 +413,16 @@ public partial class MainWindow : Window
             _ => "SCANNED",
         };
         RescanButton.Visibility = Visibility.Visible;
+        if (result.Stats.ErrorCount > 0)
+        {
+            ScanWarningText.Text = $"{result.Stats.ErrorCount:N0} unreadable location{(result.Stats.ErrorCount == 1 ? "" : "s")}";
+            ScanWarningBadge.ToolTip = "The displayed total is incomplete because one or more locations could not be read.";
+            ScanWarningBadge.Visibility = Visibility.Visible;
+        }
+        else
+        {
+            ScanWarningBadge.Visibility = Visibility.Collapsed;
+        }
 
         Burst.Volume = result.Volume;
         _backHistory.Clear();
@@ -723,6 +793,12 @@ public partial class MainWindow : Window
     {
         if (e.Key == Key.Escape)
         {
+            if (UpdateOverlay.Visibility == Visibility.Visible)
+            {
+                OnCloseUpdateOverlayClick(sender, e);
+                e.Handled = true;
+                return;
+            }
             if (_scanner.IsScanning) { _scanner.Cancel(); e.Handled = true; return; }
             if (SearchBox.Text.Length > 0) { SearchBox.Clear(); e.Handled = true; return; }
         }
@@ -888,6 +964,7 @@ public partial class MainWindow : Window
     private ReleaseInfo? _availableRelease;
     private string? _downloadedZipPath;
     private bool _isDownloadingUpdate;
+    private CancellationTokenSource? _updateDownloadCts;
 
     private async Task CheckForUpdatesAsync(bool silent)
     {
@@ -933,7 +1010,7 @@ public partial class MainWindow : Window
     {
         UpdateTitleText.Text = $"Update Available: {release.TagName}";
         UpdateVersionSubtitle.Text = $"Current: v{UpdateService.GetCurrentVersion()}  ·  New: {release.TagName}";
-        UpdateNotesText.Text = release.ReleaseNotes;
+        UpdateNotesText.Text = FormatReleaseNotes(release.ReleaseNotes);
         UpdateProgressPanel.Visibility = Visibility.Collapsed;
         UpdateProgressBar.Value = 0;
         UpdateActionButton.Content = "Download & Install";
@@ -941,7 +1018,11 @@ public partial class MainWindow : Window
         UpdateCancelButton.IsEnabled = true;
         _downloadedZipPath = null;
         _isDownloadingUpdate = false;
+        TopNavigationBar.IsEnabled = false;
+        LandingPanel.IsEnabled = false;
+        ContentShell.IsEnabled = false;
         UpdateOverlay.Visibility = Visibility.Visible;
+        Dispatcher.BeginInvoke(() => UpdateActionButton.Focus(), DispatcherPriority.Input);
     }
 
     private void OnUpdateBadgeClick(object sender, RoutedEventArgs e)
@@ -972,8 +1053,30 @@ public partial class MainWindow : Window
                 MessageBoxButton.YesNo,
                 MessageBoxImage.Question);
             if (result != MessageBoxResult.Yes) return;
+            UpdateProgressText.Text = "Cancelling download…";
+            _updateDownloadCts?.Cancel();
+            return;
         }
+        HideUpdateOverlay();
+    }
+
+    private void HideUpdateOverlay()
+    {
         UpdateOverlay.Visibility = Visibility.Collapsed;
+        TopNavigationBar.IsEnabled = true;
+        LandingPanel.IsEnabled = true;
+        ContentShell.IsEnabled = true;
+    }
+
+    private static string FormatReleaseNotes(string markdown)
+    {
+        if (string.IsNullOrWhiteSpace(markdown)) return "No release notes provided.";
+        return string.Join('\n', markdown.Replace("\r", "").Split('\n').Select(line =>
+        {
+            string text = line.TrimEnd();
+            while (text.StartsWith('#')) text = text[1..].TrimStart();
+            return text.Replace("**", "").Replace("`", "");
+        })).Trim();
     }
 
     private void OnViewUpdateGitHubClick(object sender, RoutedEventArgs e)
@@ -995,7 +1098,7 @@ public partial class MainWindow : Window
         {
             try
             {
-                UpdateService.ApplyUpdateAndRestart(_downloadedZipPath);
+                UpdateService.ApplyUpdateAndRestart(_downloadedZipPath, _availableRelease.Sha256);
             }
             catch (Exception ex)
             {
@@ -1011,8 +1114,11 @@ public partial class MainWindow : Window
 
         // Otherwise, download update
         _isDownloadingUpdate = true;
+        _updateDownloadCts?.Dispose();
+        _updateDownloadCts = new CancellationTokenSource();
         UpdateActionButton.IsEnabled = false;
-        UpdateCancelButton.IsEnabled = false;
+        UpdateCancelButton.IsEnabled = true;
+        UpdateCancelButton.Content = "Cancel";
         UpdateProgressPanel.Visibility = Visibility.Visible;
         UpdateProgressBar.Value = 0;
         UpdateProgressText.Text = "Starting download…";
@@ -1027,7 +1133,8 @@ public partial class MainWindow : Window
 
         try
         {
-            string zip = await _updateService.DownloadUpdateAsync(_availableRelease, progress);
+            string zip = await _updateService.DownloadUpdateAsync(
+                _availableRelease, progress, _updateDownloadCts.Token);
             _downloadedZipPath = zip;
             _isDownloadingUpdate = false;
 
@@ -1035,12 +1142,22 @@ public partial class MainWindow : Window
             UpdateActionButton.Content = "Restart to Apply";
             UpdateActionButton.IsEnabled = true;
             UpdateCancelButton.IsEnabled = true;
+            UpdateCancelButton.Content = "Later";
+        }
+        catch (OperationCanceledException)
+        {
+            _isDownloadingUpdate = false;
+            UpdateActionButton.IsEnabled = true;
+            UpdateCancelButton.IsEnabled = true;
+            UpdateCancelButton.Content = "Later";
+            UpdateProgressText.Text = "Download cancelled.";
         }
         catch (Exception ex)
         {
             _isDownloadingUpdate = false;
             UpdateActionButton.IsEnabled = true;
             UpdateCancelButton.IsEnabled = true;
+            UpdateCancelButton.Content = "Later";
             UpdateProgressText.Text = "Download failed.";
             MessageBox.Show(
                 this,
@@ -1049,6 +1166,10 @@ public partial class MainWindow : Window
                 MessageBoxButton.OK,
                 MessageBoxImage.Error);
         }
+        finally
+        {
+            _updateDownloadCts?.Dispose();
+            _updateDownloadCts = null;
+        }
     }
 }
-

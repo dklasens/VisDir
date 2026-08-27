@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Windows.Automation;
 using System.Windows;
 using System.Windows.Input;
 using System.Windows.Media;
@@ -24,6 +25,15 @@ public class SunburstControl : SkiaSharp.Views.WPF.SKElement
     private readonly List<LegendItem> _legendItems = [];
     private int _cacheWidth;
     private int _cacheHeight;
+    private int _keyboardIndex = -1;
+
+    // Typeface objects own native handles. Keep one set for the process lifetime rather
+    // than allocating undisposed handles on every paint/animation frame.
+    private static readonly SKTypeface RegularTypeface = SKTypeface.FromFamilyName("Segoe UI");
+    private static readonly SKTypeface MediumTypeface = SKTypeface.FromFamilyName(
+        "Segoe UI", SKFontStyleWeight.Medium, SKFontStyleWidth.Normal, SKFontStyleSlant.Upright);
+    private static readonly SKTypeface BoldTypeface = SKTypeface.FromFamilyName(
+        "Segoe UI", SKFontStyleWeight.Bold, SKFontStyleWidth.Normal, SKFontStyleSlant.Upright);
 
     // Drill transition state: new layout rendered under an interpolated
     // angle/depth transform that starts at the previous view's framing.
@@ -82,7 +92,11 @@ public class SunburstControl : SkiaSharp.Views.WPF.SKElement
 
         c._hovered = null;
         c._selectedSource = null;
+        c._keyboardIndex = -1;
         c._layout = e.NewValue is FsNode root ? SunburstLayout.Build(root) : null;
+        AutomationProperties.SetName(c, e.NewValue is FsNode namedRoot
+            ? $"Disk usage sunburst for {namedRoot.Name}, {SizeFormatter.Format(namedRoot.TotalAllocated)}"
+            : "Disk usage sunburst");
         c.RebuildVisibleNodes();
         c.ClearRenderCache();
         c.BeginTransition(oldLayout, oldVisible, e.NewValue as FsNode);
@@ -171,6 +185,18 @@ public class SunburstControl : SkiaSharp.Views.WPF.SKElement
         base.OnMouseLeave(e);
     }
 
+    protected override void OnGotKeyboardFocus(KeyboardFocusChangedEventArgs e)
+    {
+        base.OnGotKeyboardFocus(e);
+        InvalidateVisual();
+    }
+
+    protected override void OnLostKeyboardFocus(KeyboardFocusChangedEventArgs e)
+    {
+        base.OnLostKeyboardFocus(e);
+        InvalidateVisual();
+    }
+
     protected override void OnMouseMove(MouseEventArgs e)
     {
         base.OnMouseMove(e);
@@ -194,6 +220,7 @@ public class SunburstControl : SkiaSharp.Views.WPF.SKElement
     protected override void OnMouseLeftButtonUp(MouseButtonEventArgs e)
     {
         base.OnMouseLeftButtonUp(e);
+        Focus();
         if (_animating) return;
         var p = e.GetPosition(this);
 
@@ -207,6 +234,60 @@ public class SunburstControl : SkiaSharp.Views.WPF.SKElement
         var hit = HitTestAt(p);
         if (hit is not null && !hit.IsAggregatedWedge && hit.Depth > 0)
             NodeClicked?.Invoke(hit.Source);
+    }
+
+    protected override void OnKeyDown(KeyEventArgs e)
+    {
+        base.OnKeyDown(e);
+        List<SunburstNode> choices = _visibleNodes
+            .Where(n => n.Depth > 0 && !n.IsAggregatedWedge)
+            .ToList();
+        if (choices.Count == 0) return;
+
+        switch (e.Key)
+        {
+            case Key.Left:
+            case Key.Up:
+                _keyboardIndex = (_keyboardIndex - 1 + choices.Count) % choices.Count;
+                SelectKeyboardNode(choices[_keyboardIndex]);
+                e.Handled = true;
+                break;
+            case Key.Right:
+            case Key.Down:
+                _keyboardIndex = (_keyboardIndex + 1) % choices.Count;
+                SelectKeyboardNode(choices[_keyboardIndex]);
+                e.Handled = true;
+                break;
+            case Key.Home:
+                _keyboardIndex = 0;
+                SelectKeyboardNode(choices[0]);
+                e.Handled = true;
+                break;
+            case Key.End:
+                _keyboardIndex = choices.Count - 1;
+                SelectKeyboardNode(choices[^1]);
+                e.Handled = true;
+                break;
+            case Key.Enter:
+            case Key.Space:
+                if (_keyboardIndex < 0) _keyboardIndex = 0;
+                NodeClicked?.Invoke(choices[Math.Min(_keyboardIndex, choices.Count - 1)].Source);
+                e.Handled = true;
+                break;
+            case Key.Back:
+                CenterClicked?.Invoke();
+                e.Handled = true;
+                break;
+        }
+    }
+
+    private void SelectKeyboardNode(SunburstNode node)
+    {
+        _selectedSource = node.Source;
+        SetHovered(node);
+        AutomationProperties.SetName(this,
+            $"Disk usage sunburst. Selected {node.DisplayName}, {SizeFormatter.Format(node.Source.TotalAllocated)}");
+        InvalidateVisual();
     }
 
     private void SetHovered(SunburstNode? node)
@@ -284,7 +365,7 @@ public class SunburstControl : SkiaSharp.Views.WPF.SKElement
     {
         SKCanvas canvas = e.Surface.Canvas;
         int width = e.Info.Width, height = e.Info.Height;
-        canvas.Clear(Palette.Background);
+        canvas.Clear(SystemParameters.HighContrast ? CanvasBackground : Palette.Background);
 
         if (_layout is null || ViewRoot is null) return;
 
@@ -299,8 +380,22 @@ public class SunburstControl : SkiaSharp.Views.WPF.SKElement
         {
             EnsureRenderCache(width, height, g);
             DrawTree(canvas);
+            DrawLabels(canvas, g, scale);
+            DrawLegend(canvas, height, scale);
         }
         DrawCenter(canvas, g, scale);
+        if (IsKeyboardFocused)
+        {
+            using var focusPaint = new SKPaint
+            {
+                Style = SKPaintStyle.Stroke,
+                StrokeWidth = Math.Max(2f, 2f * scale),
+                Color = SystemParameters.HighContrast ? CanvasAccent : new SKColor(0xFF, 0xD4, 0x86),
+                IsAntialias = true,
+            };
+            canvas.DrawRoundRect(new SKRect(2 * scale, 2 * scale, width - 2 * scale, height - 2 * scale),
+                6 * scale, 6 * scale, focusPaint);
+        }
     }
 
     private void RebuildVisibleNodes()
@@ -331,8 +426,7 @@ public class SunburstControl : SkiaSharp.Views.WPF.SKElement
         {
             float rMid = g.inner + node.Depth * g.band + g.ringW / 2;
             var rect = new SKRect(g.cx - rMid, g.cy - rMid, g.cx + rMid, g.cy + rMid);
-            var path = new SKPath();
-            path.AddArc(rect, Degrees(node.Angle0), Degrees(node.Sweep));
+            var path = CreateArcPath(rect, Degrees(node.Angle0), Degrees(node.Sweep));
             _cachedArcs.Add(new CachedArc(node, path, g.ringW));
         }
 
@@ -353,8 +447,7 @@ public class SunburstControl : SkiaSharp.Views.WPF.SKElement
             {
                 if (bytes == 0) return;
                 double sweep = SunburstLayout.FullCircle * bytes / volume.TotalBytes;
-                var path = new SKPath();
-                path.AddArc(rect, Degrees(cursor), Degrees(sweep));
+                var path = CreateArcPath(rect, Degrees(cursor), Degrees(sweep));
                 _capacityArcs.Add(new CachedCapacityArc(path, color, g.ringW));
                 _legendItems.Add(new LegendItem(color, $"{label} · {SizeFormatter.Format(bytes)}"));
                 cursor += sweep;
@@ -445,8 +538,7 @@ public class SunburstControl : SkiaSharp.Views.WPF.SKElement
             if (rMid <= g.ringW / 2) continue; // fully inside the center hole
 
             var rect = new SKRect(g.cx - rMid, g.cy - rMid, g.cx + rMid, g.cy + rMid);
-            using var path = new SKPath();
-            path.AddArc(rect, Degrees(angleOffset + node.Angle0 * angleScale), Degrees(sweep));
+            using var path = CreateArcPath(rect, Degrees(angleOffset + node.Angle0 * angleScale), Degrees(sweep));
             SKColor color = Palette.ColorFor(node, false);
             stroke.Color = bloomAlpha == 255 ? color : color.WithAlpha(bloomAlpha);
             canvas.DrawPath(path, stroke);
@@ -465,10 +557,8 @@ public class SunburstControl : SkiaSharp.Views.WPF.SKElement
         {
             Color = LabelColor,
             IsAntialias = true,
-            Typeface = SKTypeface.FromFamilyName("Segoe UI", SKFontStyleWeight.Medium, SKFontStyleWidth.Normal, SKFontStyleSlant.Upright),
-            TextSize = 10.5f * scale,
-            TextAlign = SKTextAlign.Center,
         };
+        using var labelFont = new SKFont(MediumTypeface, 10.5f * scale);
         using var haloPaint = new SKPaint
         {
             Color = Palette.LabelHalo,
@@ -476,9 +566,6 @@ public class SunburstControl : SkiaSharp.Views.WPF.SKElement
             Style = SKPaintStyle.Stroke,
             StrokeWidth = 3f * scale,
             StrokeJoin = SKStrokeJoin.Round,
-            Typeface = labelPaint.Typeface,
-            TextSize = labelPaint.TextSize,
-            TextAlign = SKTextAlign.Center,
         };
 
         foreach (CachedArc arc in _cachedArcs)
@@ -492,8 +579,11 @@ public class SunburstControl : SkiaSharp.Views.WPF.SKElement
             // Only label wedges where the full name fits comfortably — partial
             // labels and ellipses read as visual noise on a dense chart.
             string text = node.DisplayName.TrimEnd('\\');
-            if (text.Length == 0 || labelPaint.MeasureText(text) > arcLen - 10 * scale) continue;
-            labelPaint.Color = ShouldDim(node, dimActive, focusBranch) ? LabelDimColor : LabelColor;
+            if (text.Length == 0 || labelFont.MeasureText(text, labelPaint) > arcLen - 10 * scale) continue;
+            labelPaint.Color = SystemParameters.HighContrast
+                ? CanvasForeground
+                : ShouldDim(node, dimActive, focusBranch) ? LabelDimColor : LabelColor;
+            haloPaint.Color = SystemParameters.HighContrast ? CanvasBackground : Palette.LabelHalo;
 
             canvas.Save();
             canvas.RotateRadians((float)node.MidAngle, g.cx, g.cy);
@@ -501,17 +591,17 @@ public class SunburstControl : SkiaSharp.Views.WPF.SKElement
             canvas.RotateDegrees(90);
             double degrees = node.MidAngle * 180 / Math.PI;
             if (degrees is > 90 and < 270) canvas.RotateDegrees(180); // keep text upright on the left half
-            canvas.DrawText(text, 0, labelPaint.TextSize * 0.34f, haloPaint);
-            canvas.DrawText(text, 0, labelPaint.TextSize * 0.34f, labelPaint);
+            canvas.DrawText(text, 0, labelFont.Size * 0.34f, SKTextAlign.Center, labelFont, haloPaint);
+            canvas.DrawText(text, 0, labelFont.Size * 0.34f, SKTextAlign.Center, labelFont, labelPaint);
             canvas.Restore();
         }
     }
 
-    private static string? TruncateToFit(SKPaint paint, string text, float maxW)
+    private static string? TruncateToFit(SKFont font, SKPaint paint, string text, float maxW)
     {
         const string ellipsis = "…";
         int length = text.Length;
-        while (length > 0 && paint.MeasureText(text[..length] + ellipsis) > maxW) length--;
+        while (length > 0 && font.MeasureText(text[..length] + ellipsis, paint) > maxW) length--;
         return length >= 5 ? text[..length] + ellipsis : null;
     }
 
@@ -520,11 +610,10 @@ public class SunburstControl : SkiaSharp.Views.WPF.SKElement
         if (_legendItems.Count == 0) return;
         using var textPaint = new SKPaint
         {
-            Color = new SKColor(0xA9, 0xAD, 0xBA),
+            Color = SystemParameters.HighContrast ? CanvasForeground : new SKColor(0xA9, 0xAD, 0xBA),
             IsAntialias = true,
-            Typeface = SKTypeface.FromFamilyName("Segoe UI"),
-            TextSize = 10.5f * scale,
         };
+        using var textFont = new SKFont(RegularTypeface, 10.5f * scale);
         using var chipPaint = new SKPaint { IsAntialias = true, Style = SKPaintStyle.Fill };
         using var chipBorder = new SKPaint { IsAntialias = true, Style = SKPaintStyle.Stroke, StrokeWidth = 1f * scale, Color = new SKColor(0x3A, 0x3E, 0x4A) };
 
@@ -537,8 +626,8 @@ public class SunburstControl : SkiaSharp.Views.WPF.SKElement
             canvas.DrawRoundRect(x, y - chip, chip, chip, 2.5f * scale, 2.5f * scale, chipPaint);
             canvas.DrawRoundRect(x, y - chip, chip, chip, 2.5f * scale, 2.5f * scale, chipBorder);
             x += chip + 5 * scale;
-            canvas.DrawText(item.Text, x, y, textPaint);
-            x += textPaint.MeasureText(item.Text) + 18 * scale;
+            canvas.DrawText(item.Text, x, y, SKTextAlign.Left, textFont, textPaint);
+            x += textFont.MeasureText(item.Text, textPaint) + 18 * scale;
         }
     }
 
@@ -561,51 +650,46 @@ public class SunburstControl : SkiaSharp.Views.WPF.SKElement
         bool isShowingRoot = ReferenceEquals(shown, root);
 
         // Center circle background with subtle ring border
-        using (var fill = new SKPaint { Color = Palette.CenterFill, IsAntialias = true, Style = SKPaintStyle.Fill })
+        using (var fill = new SKPaint { Color = SystemParameters.HighContrast ? CanvasBackground : Palette.CenterFill, IsAntialias = true, Style = SKPaintStyle.Fill })
             canvas.DrawCircle(g.cx, g.cy, g.inner - 1, fill);
 
-        using (var rim = new SKPaint { Color = new SKColor(0x2E, 0x34, 0x48), IsAntialias = true, Style = SKPaintStyle.Stroke, StrokeWidth = 1.5f * scale })
+        using (var rim = new SKPaint { Color = SystemParameters.HighContrast ? CanvasForeground : new SKColor(0x2E, 0x34, 0x48), IsAntialias = true, Style = SKPaintStyle.Stroke, StrokeWidth = 1.5f * scale })
             canvas.DrawCircle(g.cx, g.cy, g.inner - 1, rim);
 
         float maxW = g.inner * 2f * 0.82f;
-        var accentColor = new SKColor(0x5C, 0xD6, 0x8D); // DaisyDisk mint green
+        var accentColor = SystemParameters.HighContrast ? CanvasAccent : new SKColor(0x5C, 0xD6, 0x8D);
 
         if (isShowingRoot)
         {
             var (number, unit) = SplitSize(root.TotalAllocated);
             using var numPaint = new SKPaint
             {
-                Color = SKColors.White,
+                Color = SystemParameters.HighContrast ? CanvasForeground : SKColors.White,
                 IsAntialias = true,
-                Typeface = SKTypeface.FromFamilyName("Segoe UI", SKFontStyleWeight.Bold, SKFontStyleWidth.Normal, SKFontStyleSlant.Upright),
-                TextSize = 20 * scale,
-                TextAlign = SKTextAlign.Center,
             };
+            using var numFont = new SKFont(BoldTypeface, 20 * scale);
             using var unitPaint = new SKPaint
             {
                 Color = accentColor,
                 IsAntialias = true,
-                Typeface = SKTypeface.FromFamilyName("Segoe UI", SKFontStyleWeight.Bold, SKFontStyleWidth.Normal, SKFontStyleSlant.Upright),
-                TextSize = 14 * scale,
-                TextAlign = SKTextAlign.Center,
             };
+            using var unitFont = new SKFont(BoldTypeface, 14 * scale);
 
-            while (numPaint.TextSize > 12 * scale && numPaint.MeasureText(number) > maxW) numPaint.TextSize -= 1f;
+            while (numFont.Size > 12 * scale && numFont.MeasureText(number, numPaint) > maxW) numFont.Size -= 1f;
 
-            canvas.DrawText(number, g.cx, g.cy - 1 * scale, numPaint);
-            canvas.DrawText(unit, g.cx, g.cy + 17 * scale, unitPaint);
+            canvas.DrawText(number, g.cx, g.cy - 1 * scale, SKTextAlign.Center, numFont, numPaint);
+            canvas.DrawText(unit, g.cx, g.cy + 17 * scale, SKTextAlign.Center, unitFont, unitPaint);
 
             if (_hoverCenter && root.Parent is not null)
             {
                 using var hintPaint = new SKPaint
                 {
-                    Color = new SKColor(0x8A, 0x92, 0xA8),
+                    Color = SystemParameters.HighContrast ? CanvasForeground : new SKColor(0x8A, 0x92, 0xA8),
                     IsAntialias = true,
-                    Typeface = SKTypeface.FromFamilyName("Segoe UI"),
-                    TextSize = 9 * scale,
-                    TextAlign = SKTextAlign.Center,
                 };
-                canvas.DrawText("click to go up", g.cx, g.cy + 30 * scale, hintPaint);
+                using var hintFont = new SKFont(RegularTypeface, 9 * scale);
+                canvas.DrawText("click to go up", g.cx, g.cy + 30 * scale,
+                    SKTextAlign.Center, hintFont, hintPaint);
             }
         }
         else
@@ -616,29 +700,39 @@ public class SunburstControl : SkiaSharp.Views.WPF.SKElement
 
             using var namePaint = new SKPaint
             {
-                Color = SKColors.White,
+                Color = SystemParameters.HighContrast ? CanvasForeground : SKColors.White,
                 IsAntialias = true,
-                Typeface = SKTypeface.FromFamilyName("Segoe UI", SKFontStyleWeight.Medium, SKFontStyleWidth.Normal, SKFontStyleSlant.Upright),
-                TextSize = 13.5f * scale,
-                TextAlign = SKTextAlign.Center,
             };
+            using var nameFont = new SKFont(MediumTypeface, 13.5f * scale);
             using var sizePaint = new SKPaint
             {
                 Color = accentColor,
                 IsAntialias = true,
-                Typeface = SKTypeface.FromFamilyName("Segoe UI", SKFontStyleWeight.Bold, SKFontStyleWidth.Normal, SKFontStyleSlant.Upright),
-                TextSize = 15 * scale,
-                TextAlign = SKTextAlign.Center,
             };
+            using var sizeFont = new SKFont(BoldTypeface, 15 * scale);
 
-            while (namePaint.TextSize > 9.5f * scale && namePaint.MeasureText(name) > maxW) namePaint.TextSize -= 1f;
-            if (namePaint.MeasureText(name) > maxW)
-                name = TruncateToFit(namePaint, name, maxW) ?? "…";
+            while (nameFont.Size > 9.5f * scale && nameFont.MeasureText(name, namePaint) > maxW) nameFont.Size -= 1f;
+            if (nameFont.MeasureText(name, namePaint) > maxW)
+                name = TruncateToFit(nameFont, namePaint, name, maxW) ?? "…";
 
-            canvas.DrawText(name, g.cx, g.cy - 3 * scale, namePaint);
-            canvas.DrawText(size, g.cx, g.cy + 15 * scale, sizePaint);
+            canvas.DrawText(name, g.cx, g.cy - 3 * scale, SKTextAlign.Center, nameFont, namePaint);
+            canvas.DrawText(size, g.cx, g.cy + 15 * scale, SKTextAlign.Center, sizeFont, sizePaint);
         }
     }
+
+    private static SKPath CreateArcPath(SKRect bounds, float startAngle, float sweepAngle)
+    {
+        using var builder = new SKPathBuilder();
+        builder.AddArc(bounds, startAngle, sweepAngle);
+        return builder.Detach();
+    }
+
+    private static SKColor CanvasBackground => ToSkColor(SystemColors.WindowColor);
+    private static SKColor CanvasForeground => ToSkColor(SystemColors.WindowTextColor);
+    private static SKColor CanvasAccent => ToSkColor(SystemColors.HighlightColor);
+
+    private static SKColor ToSkColor(System.Windows.Media.Color color) =>
+        new(color.R, color.G, color.B, color.A);
 
     private static float Degrees(double radians) => (float)(radians * 180 / Math.PI);
 }

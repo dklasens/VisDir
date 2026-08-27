@@ -7,7 +7,7 @@
     <SummaryInformation Description="Fast visual disk-space analyzer for Windows" />
     <MajorUpgrade DowngradeErrorMessage="A newer version of VisDir is already installed." />
     <MediaTemplate EmbedCab="yes" />
-    <Icon Id="VisDirIcon" SourceFile="..\src\VisDir.App\Assets\visdir-icon.ico" />
+    <Icon Id="VisDirIcon" SourceFile="$(var.RepoRoot)\src\VisDir.App\Assets\visdir-icon.ico" />
     <Property Id="ARPPRODUCTICON" Value="VisDirIcon" />
 
     <StandardDirectory Id="ProgramFiles64Folder">
@@ -22,7 +22,7 @@
 
   <Fragment>
     <ComponentGroup Id="PublishedFiles" Directory="INSTALLFOLDER">
-      <Files Include="..\artifacts\publish\win-x64\**" />
+      <Files Include="$(var.RepoRoot)\artifacts\publish\win-x64\**" />
     </ComponentGroup>
   </Fragment>
 

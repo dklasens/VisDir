@@ -95,9 +95,19 @@ public static class PathUtils
     /// <summary>Returns the path with a normalized trailing separator removed and consistent casing of drive letters.</summary>
     public static string NormalizeScanRoot(string path)
     {
-        path = path.Trim().TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
-        if (path.Length == 2 && path[1] == ':') path += "\\";
+        path = path.Trim();
         if (path.Length == 0) throw new ArgumentException("Empty path.", nameof(path));
+
+        // A bare drive designator means the drive root, not that drive's process-relative
+        // working directory. Resolve every other relative local path before adding the
+        // extended Win32 prefix used by the compatible scanner.
+        if (path.Length == 2 && path[1] == ':')
+            path += "\\";
+        else if (!Path.IsPathFullyQualified(path))
+            path = Path.GetFullPath(path);
+
+        path = path.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        if (path.Length == 2 && path[1] == ':') path += "\\";
         return path;
     }
 
