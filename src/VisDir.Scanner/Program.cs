@@ -45,13 +45,15 @@ public static class ScannerCli
         {
             switch (args[i].ToLowerInvariant())
             {
-                case "--out" when i + 1 < args.Length:
+                case "--out":
+                    if (i + 1 >= args.Length) { Console.Error.WriteLine("Missing value for --out."); return 1; }
                     outFile = args[++i];
                     break;
                 case "--report":
                     report = true;
                     break;
-                case "--mode" when i + 1 < args.Length:
+                case "--mode":
+                    if (i + 1 >= args.Length) { Console.Error.WriteLine("Missing value for --mode."); return 1; }
                     mode = args[++i].ToLowerInvariant();
                     if (mode is not ("mft" or "generic" or "auto"))
                     { Console.Error.WriteLine($"Bad --mode '{mode}'"); return 1; }
@@ -60,11 +62,18 @@ public static class ScannerCli
                     diffVerify = true;
                     break;
                 case "--mftprobe":
+                    if (i + 1 >= args.Length) { Console.Error.WriteLine("Missing path for --mftprobe."); return 1; }
                     return RunMftProbe(args[++i]);
-                case "--top" when i + 1 < args.Length && int.TryParse(args[++i], out var t):
+                case "--top":
+                    if (i + 1 >= args.Length) { Console.Error.WriteLine("Missing value for --top."); return 1; }
+                    if (!int.TryParse(args[++i], out int t))
+                    { Console.Error.WriteLine($"Bad --top value '{args[i]}'"); return 1; }
                     top = Math.Clamp(t, 0, 500);
                     break;
-                case "--threads" when i + 1 < args.Length && int.TryParse(args[++i], out var th):
+                case "--threads":
+                    if (i + 1 >= args.Length) { Console.Error.WriteLine("Missing value for --threads."); return 1; }
+                    if (!int.TryParse(args[++i], out int th))
+                    { Console.Error.WriteLine($"Bad --threads value '{args[i]}'"); return 1; }
                     threads = th;
                     break;
                 case "-h" or "--help":
@@ -81,6 +90,12 @@ public static class ScannerCli
         {
             PrintUsage();
             return 1;
+        }
+
+        if (outFile is not null)
+        {
+            string? snapshotError = ValidateSnapshotPath(outFile);
+            if (snapshotError is not null) { Console.Error.WriteLine(snapshotError); return 1; }
         }
 
         using var cts = new CancellationTokenSource();
@@ -128,9 +143,21 @@ public static class ScannerCli
 
         if (outFile is not null)
         {
-            using var fs = new FileStream(outFile, FileMode.Create, FileAccess.Write, FileShare.None, 1 << 16);
-            TreeSerializer.Write(fs, result);
-            Console.Error.WriteLine($"SNAPSHOT {outFile}");
+            // Temp + rename in the destination directory: a crash never leaves a half-written snapshot.
+            string full = Path.GetFullPath(outFile);
+            Directory.CreateDirectory(Path.GetDirectoryName(full)!);
+            string temp = full + $".partial-{Guid.NewGuid():N}";
+            try
+            {
+                using (var fs = new FileStream(temp, FileMode.CreateNew, FileAccess.Write, FileShare.None, 1 << 16))
+                    TreeSerializer.Write(fs, result);
+                File.Move(temp, full, overwrite: true);
+            }
+            finally
+            {
+                try { if (File.Exists(temp)) File.Delete(temp); } catch { }
+            }
+            Console.Error.WriteLine($"SNAPSHOT {full}");
         }
 
         if (report || outFile is null)
@@ -428,6 +455,48 @@ public static class ScannerCli
             }
         }
         Console.WriteLine();
+    }
+
+    /// <summary>
+    /// Constrains snapshot output: requires a <c>.vdir</c> file target, refuses existing
+    /// directories and Windows system directories. Returns an error message, or null when valid.
+    /// </summary>
+    internal static string? ValidateSnapshotPath(string outFile)
+    {
+        string full;
+        try
+        {
+            full = Path.GetFullPath(outFile);
+        }
+        catch (Exception ex)
+        {
+            return $"Invalid --out path: {ex.Message}";
+        }
+        if (!full.EndsWith(".vdir", StringComparison.OrdinalIgnoreCase))
+            return "The --out snapshot path must use a .vdir extension.";
+        if (Directory.Exists(full))
+            return "The --out path is an existing directory; point it at a .vdir file instead.";
+        string? parent = Path.GetDirectoryName(full);
+        if (string.IsNullOrEmpty(parent))
+            return "Invalid --out path.";
+        if (IsProtectedSystemDirectory(parent))
+            return "Refusing to write a snapshot into a Windows system directory.";
+        return null;
+    }
+
+    internal static bool IsProtectedSystemDirectory(string directory)
+    {
+        string full = Path.GetFullPath(directory).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        string windows = Environment.GetFolderPath(Environment.SpecialFolder.Windows).TrimEnd(
+            Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        string system = Environment.SystemDirectory.TrimEnd(
+            Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        return (!string.IsNullOrEmpty(windows) &&
+            (full.Equals(windows, StringComparison.OrdinalIgnoreCase) ||
+             full.StartsWith(windows + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))) ||
+            (!string.IsNullOrEmpty(system) &&
+            (full.Equals(system, StringComparison.OrdinalIgnoreCase) ||
+             full.StartsWith(system + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)));
     }
 
     private static void PrintUsage()

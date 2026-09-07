@@ -35,7 +35,7 @@ public sealed class SafetyLimitException : Exception
 public sealed class GenericScanner : IDiskScanner
 {
     private const int InitialBufferSize = 1 << 20;   // 1 MiB
-    private const int MaxBufferSize = 16 << 20;
+    private const int MaxBufferSize = 4 << 20;       // cap per-worker scratch at 4 MiB
     private const int MaxDepth = 512;
     private const long DefaultMaxDirs = 20_000_000;
     private const int WorkQueueCapacity = 50_000;
@@ -57,10 +57,23 @@ public sealed class GenericScanner : IDiskScanner
     private volatile bool _cancelled;
     private bool _useExtdClass = true;   // sticky downgrade if volume rejects extd class
     private readonly ThreadLocal<byte[]?> _buffer = new(() => null);
+    private readonly ThreadLocal<LocalTally> _local = new(() => new LocalTally(), trackAllValues: true);
 
     // Hardlink dedup: same FileId reached via multiple directories counts allocated
     // bytes once. FileId is only available from the extended info class (key==0 otherwise).
-    private readonly System.Collections.Concurrent.ConcurrentDictionary<long, byte> _seenFileIds = new();
+    // Sharded by FileId hash so workers rarely contend on the same lock.
+    private const int DedupShards = 16;
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<long, byte>[] _seenFileIds =
+        Enumerable.Range(0, DedupShards)
+            .Select(_ => new System.Collections.Concurrent.ConcurrentDictionary<long, byte>())
+            .ToArray();
+
+    private sealed class LocalTally
+    {
+        public long Files;
+        public long Dirs;
+        public long Bytes;
+    }
     private static readonly bool TraceErrors =
         Environment.GetEnvironmentVariable("VISDIR_TRACE_ERRORS") == "1";
     private readonly System.Collections.Concurrent.ConcurrentDictionary<string, int> _errorCounts = new();
@@ -125,6 +138,20 @@ public sealed class GenericScanner : IDiskScanner
         }
 
         cancellationToken.ThrowIfCancellationRequested();
+
+        // Authoritative totals: sum the per-worker tallies (workers are all joined).
+        // Live globals fed progress/brake checks mid-scan; the overwrite also heals
+        // any race skew in those mirrors.
+        long files = 0, dirs = 1, bytes = 0; // +1 root (initialized as _dirsSeen = 1)
+        foreach (LocalTally t in _local.Values)
+        {
+            files += t.Files;
+            dirs += t.Dirs;
+            bytes += t.Bytes;
+        }
+        _filesSeen = files;
+        _dirsSeen = dirs;
+        _bytesSeen = bytes;
         if (_braked)
             throw new SafetyLimitException(
                 $"Scan aborted: directory count exceeded safety limit ({MaxDirsSafetyLimit:N0}). " +
@@ -170,30 +197,41 @@ public sealed class GenericScanner : IDiskScanner
         _cancelled = false;
         _snapshotTaken = 0;
         _useExtdClass = true;
-        _seenFileIds.Clear();
+        foreach (var shard in _seenFileIds) shard.Clear();
+        foreach (LocalTally t in _local.Values) t.Files = t.Dirs = t.Bytes = 0;
         _errorCounts.Clear();
         while (_errorSamples.TryDequeue(out _)) { }
     }
 
     private async Task WorkerLoop(ChannelReader<Item> reader, ChannelWriter<Item> writer, CancellationToken ct)
     {
-        while (!_cancelled)
+        try
         {
-            Item item;
-            try
+            while (!_cancelled)
             {
-                item = await reader.ReadAsync(ct).ConfigureAwait(false);
-            }
-            catch (OperationCanceledException)
-            {
-                return;
-            }
-            catch (ChannelClosedException)
-            {
-                return;
-            }
+                Item item;
+                try
+                {
+                    item = await reader.ReadAsync(ct).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    return;
+                }
+                catch (ChannelClosedException)
+                {
+                    return;
+                }
 
-            await HandleItem(item, writer, ct).ConfigureAwait(false);
+                await HandleItem(item, writer, ct).ConfigureAwait(false);
+            }
+        }
+        finally
+        {
+            // Return this worker's scratch to 1 MiB at scan end so idle threads
+            // don't pin a 4 MiB buffer until the next scan (or forever).
+            if (_buffer.Value is { Length: > InitialBufferSize })
+                _buffer.Value = new byte[InitialBufferSize];
         }
     }
 
@@ -384,6 +422,15 @@ public sealed class GenericScanner : IDiskScanner
                         Volatile.Write(ref _useExtdClass, false);
                         throw new CapabilityDowngradeException();
                     }
+                    if (err == NativeMethods.ERROR_MORE_DATA && buf.Length < MaxBufferSize)
+                    {
+                        // Single entry larger than the scratch: double up to the 4 MiB
+                        // cap and retry on the same handle. Anything bigger is
+                        // pathological — surface it instead of growing without bound.
+                        buf = new byte[Math.Min(buf.Length * 2, MaxBufferSize)];
+                        _buffer.Value = buf;
+                        continue;
+                    }
                     if (err == NativeMethods.ERROR_ACCESS_DENIED)
                         throw new DirectoryAccessDeniedException();
                     throw new Win32Exception(err);
@@ -398,12 +445,6 @@ public sealed class GenericScanner : IDiskScanner
                 if (parsed < 0) throw new CorruptBatchException();
                 if (parsed == 0) break; // defensive: no forward progress possible
 
-                if (parsed > 2048 && buf.Length < MaxBufferSize)
-                {
-                    var bigger = new byte[Math.Min(buf.Length * 2, MaxBufferSize)];
-                    _buffer.Value = bigger;
-                    buf = bigger;
-                }
             }
         }
         finally
@@ -425,6 +466,8 @@ public sealed class GenericScanner : IDiskScanner
         byte* cur = basePtr;
         byte* end = basePtr + bufferLength;
         int count = 0;
+        LocalTally tally = _local.Value!;
+        long files0 = tally.Files, dirs0 = tally.Dirs, bytes0 = tally.Bytes;
 
         while (cur + nameOffset <= end)
         {
@@ -488,7 +531,7 @@ public sealed class GenericScanner : IDiskScanner
 
             bool hardlinkDup = false;
             if (!isDir && fileKey != 0)
-                hardlinkDup = !_seenFileIds.TryAdd(fileKey, 0);
+                hardlinkDup = !_seenFileIds[(int)((uint)fileKey.GetHashCode() & (DedupShards - 1))].TryAdd(fileKey, 0);
             if (hardlinkDup)
             {
                 node.Flags |= NodeFlags.Hardlinked;
@@ -498,23 +541,29 @@ public sealed class GenericScanner : IDiskScanner
             sink.Add(node);
             count++;
 
+            // Per-entry accumulation is thread-local; one 64-bit mirror add per counter
+            // per batch keeps progress/brake readers live without per-file contention.
             if (isDir)
-            {
-                long dirs = Interlocked.Increment(ref _dirsSeen);
-                if (dirs > MaxDirsSafetyLimit)
-                {
-                    _braked = true;
-                    _cancelled = true;
-                }
-            }
+                tally.Dirs++;
             else
             {
-                Interlocked.Increment(ref _filesSeen);
-                Interlocked.Add(ref _bytesSeen, (long)node.AllocatedSize);
+                tally.Files++;
+                tally.Bytes += (long)node.AllocatedSize;
             }
 
             if (next == 0) break; // 0 marks the last entry in this batch
             cur += next;
+        }
+        // Commit this batch's deltas once, so progress/brake readers stay live with
+        // O(1) atomics per batch instead of per entry. Final totals come from the
+        // join-time tally sum in Scan().
+        long dirs = Interlocked.Add(ref _dirsSeen, tally.Dirs - dirs0);
+        Interlocked.Add(ref _filesSeen, tally.Files - files0);
+        Interlocked.Add(ref _bytesSeen, tally.Bytes - bytes0);
+        if (dirs > MaxDirsSafetyLimit)
+        {
+            _braked = true;
+            _cancelled = true;
         }
         return count;
     }

@@ -1,5 +1,9 @@
 name: Release
 
+# NOTE: tag protection — configure a tag protection rule for `v*` in the repository
+# settings so only maintainers can push release tags that trigger this workflow.
+# All third-party actions are pinned to full commit SHAs (comments name the moving tag).
+
 on:
   push:
     tags:
@@ -12,20 +16,22 @@ on:
         type: string
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  build-and-release:
+  build:
     runs-on: windows-latest
+    permissions:
+      contents: read
     env:
       CI: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
 
       - name: Setup .NET
-        uses: actions/setup-dotnet@v4
+        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
         with:
           dotnet-version: '10.0.x'
 
@@ -62,16 +68,43 @@ jobs:
         shell: pwsh
         run: ./installer/build.ps1 -SkipPublish
 
+      - name: Stage release files
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path release-files -Force | Out-Null
+          Copy-Item artifacts/publish/VisDir-win-x64.zip release-files/
+          Copy-Item artifacts/publish/VisDir-win-arm64.zip release-files/
+          Copy-Item artifacts/publish/win-x64/checksums-win-x64.sha256 release-files/
+          Copy-Item artifacts/publish/win-arm64/checksums-win-arm64.sha256 release-files/
+          Copy-Item artifacts/installer/*.msi release-files/
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-files
+          path: release-files/
+          if-no-files-found: error
+
+  publish:
+    runs-on: windows-latest
+    needs: build
+    permissions:
+      contents: write # only this job can create the GitHub Release
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-files
+          path: release-files
+
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
           generate_release_notes: true
           draft: false
           prerelease: false
           files: |
-            artifacts/publish/VisDir-win-x64.zip
-            artifacts/publish/VisDir-win-arm64.zip
-            artifacts/publish/win-x64/checksums-win-x64.sha256
-            artifacts/publish/win-arm64/checksums-win-arm64.sha256
-            artifacts/installer/*.msi
+            release-files/VisDir-win-x64.zip
+            release-files/VisDir-win-arm64.zip
+            release-files/checksums-win-x64.sha256
+            release-files/checksums-win-arm64.sha256
+            release-files/*.msi

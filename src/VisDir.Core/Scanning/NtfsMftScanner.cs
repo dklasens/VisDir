@@ -13,7 +13,8 @@ public sealed class AdminRequiredException : Exception
 
 /// <summary>
 /// WizTree-class fast path: reads the NTFS Master File Table sequentially and rebuilds the
-/// whole volume tree from raw records. Requires elevation; NTFS volumes only.
+/// whole volume tree from raw records, then prunes the result to the requested path.
+/// Requires elevation; NTFS volumes only.
 /// </summary>
 public sealed class NtfsMftScanner : IDiskScanner
 {
@@ -52,9 +53,13 @@ public sealed class NtfsMftScanner : IDiskScanner
             cancellationToken.ThrowIfCancellationRequested();
 
             Dictionary<long, MftEntryInfo> entries = ReadMft(hVolume, volumeDevice, in vol, cancellationToken, progress);
-
             FsNode root = BuildTree(entries, capacity);
             TreeOps.Finalize(root);
+
+            // The MFT read is always volume-wide; narrow the returned tree to the requested
+            // subpath so callers see the same root contract as the compatible scanner.
+            FsNode pruned = PruneToRequestedPath(root, requestedPath);
+            (long files, long dirs) = CountSubtree(pruned);
 
             return new ScanResult
             {
@@ -63,12 +68,12 @@ public sealed class NtfsMftScanner : IDiskScanner
                     BytesPerCluster = vol.BytesPerCluster,
                     FileSystemName = "NTFS",
                 },
-                Root = root,
+                Root = pruned,
                 EngineName = "mft",
                 Stats = new ScanStats
                 {
-                    FileCount = entries.Values.Count(e => !e.IsDirectory && e.InUse),
-                    DirectoryCount = entries.Values.Count(e => e.IsDirectory && e.InUse),
+                    FileCount = files,
+                    DirectoryCount = dirs,
                     ElapsedMs = sw.Elapsed.TotalMilliseconds,
                 },
             };
@@ -77,6 +82,56 @@ public sealed class NtfsMftScanner : IDiskScanner
         {
             NativeMethods.CloseHandle(hVolume);
         }
+    }
+
+    /// <summary>
+    /// Narrows a volume-wide MFT tree to <paramref name="requestedPath"/> (already normalized).
+    /// A drive root returns the whole tree; a subpath walks down by name segments, detaches the
+    /// match, and renames it to the full requested path so the root contract matches the
+    /// compatible scanner. Throws when the subpath is absent from the volume tree.
+    /// </summary>
+    private static FsNode PruneToRequestedPath(FsNode volumeRoot, string requestedPath)
+    {
+        string volumePrefix = $"{char.ToUpperInvariant(requestedPath[0])}:{Path.DirectorySeparatorChar}";
+        if (requestedPath.Equals(volumePrefix, StringComparison.OrdinalIgnoreCase))
+            return volumeRoot;
+        string relative = requestedPath.Length > 3
+            ? requestedPath[3..].Trim(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
+            : string.Empty;
+        FsNode current = volumeRoot;
+        foreach (string segment in relative.Split(
+            new[] { Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar },
+            StringSplitOptions.RemoveEmptyEntries))
+        {
+            FsNode? next = current.Children?.FirstOrDefault(c =>
+                c.Name.Equals(segment, StringComparison.OrdinalIgnoreCase));
+            if (next is null)
+                throw new InvalidOperationException(
+                    $"MFT scanning reads the whole volume; '{requestedPath}' was not found in the volume tree. " +
+                    "Use the compatible scanner for paths outside this volume.");
+            current = next;
+        }
+        current.Parent = null;
+        current.Name = requestedPath;
+        return current;
+    }
+
+    /// <summary>Single-pass file/directory count over a (possibly pruned) subtree.</summary>
+    private static (long Files, long Dirs) CountSubtree(FsNode root)
+    {
+        long files = 0, dirs = 0;
+        var stack = new Stack<FsNode>();
+        stack.Push(root);
+        while (stack.Count > 0)
+        {
+            FsNode node = stack.Pop();
+            if (node.IsDirectory) dirs++;
+            else files++;
+            if (node.Children is { } kids)
+                foreach (FsNode kid in kids)
+                    stack.Push(kid);
+        }
+        return (files, dirs);
     }
 
     public static string GetVolumeDevice(string normalizedRoot)
@@ -97,7 +152,10 @@ public sealed class NtfsMftScanner : IDiskScanner
 
         ulong validLength = Math.Min(vol.MftValidDataLength, vol.TotalClusters * vol.BytesPerCluster);
 
-        var entries = new Dictionary<long, MftEntryInfo>(capacity: 1 << 20);
+        // Size for the estimated live-record count so small volumes don't pay 1M slots
+        // up front; sparse/deleted-heavy MFTs still grow naturally from here.
+        var entries = new Dictionary<long, MftEntryInfo>(
+            capacity: (int)Math.Clamp(validLength / recordSize, 1024, 1 << 20));
         var extensionRecNos = new List<long>(1024);
         var buffer = GC.AllocateUninitializedArray<byte>(ReadBufferSize);
         bool trace = Environment.GetEnvironmentVariable("VISDIR_TRACE_ERRORS") == "1";
@@ -106,6 +164,7 @@ public sealed class NtfsMftScanner : IDiskScanner
         long recordsSeen = 0;
         ulong bytesProcessed = 0;
         var progressClock = Stopwatch.StartNew();
+        long lastReportMs = -250; // first chunk reports immediately, then >=250ms apart
 
         // Tier 1: open $MFT through the filesystem namespace — the kernel resolves
         // fragmentation/attribute-lists for us, so plain sequential reads suffice.
@@ -163,9 +222,12 @@ public sealed class NtfsMftScanner : IDiskScanner
                     if (recordsSeen >= ProgressRecordStride) recordsSeen %= ProgressRecordStride;
                 }
 
-                void ReportProgress(uint bytes)
+                void ReportProgress(uint bytes, bool flush = false)
                 {
                     bytesProcessed += bytes;
+                    long now = progressClock.ElapsedMilliseconds;
+                    if (!flush && now - lastReportMs < 250) return;
+                    lastReportMs = now;
                     double fraction = validLength > 0 ? Math.Min(0.98, (double)bytesProcessed / validLength) : -1;
                     progress?.Report(new ScanProgress(
                         entries.Count, 0, bytesProcessed, progressClock.Elapsed.TotalMilliseconds,
@@ -218,6 +280,8 @@ public sealed class NtfsMftScanner : IDiskScanner
                         }
                     }
                 }
+
+                ReportProgress(0, flush: true); // final flush so the bar never sticks
             }
         }
         finally
@@ -244,49 +308,78 @@ public sealed class NtfsMftScanner : IDiskScanner
     private static void MergeExtensionRecords(Dictionary<long, MftEntryInfo> entries, List<long> extensionRecNos)
     {
         if (extensionRecNos.Count == 0) return;
-        var removed = new HashSet<long>();
-        bool changed = true;
-        int passes = 0;
+        var removed = new HashSet<long>(extensionRecNos.Count);
+        List<long>? deferred = null; // base is itself an extension: resolve after bases fold
 
-        // Iterate to a fixed point so chained extensions (ext -> ext -> base) fold fully.
-        while (changed && passes++ < 8)
+        static void Fold(ref MftEntryInfo baseInfo, in MftEntryInfo ext)
         {
-            changed = false;
-            foreach (long recNo in extensionRecNos)
+            baseInfo.LogicalSize = Math.Max(baseInfo.LogicalSize, ext.LogicalSize);
+            // The lowest-VCN-zero record contains the complete primary-stream
+            // allocation. Never add continuation records to it.
+            baseInfo.DataAllocatedSize = Math.Max(baseInfo.DataAllocatedSize, ext.DataAllocatedSize);
+            baseInfo.AdsAllocatedSize += ext.AdsAllocatedSize;
+            baseInfo.IndexAllocationSize += ext.IndexAllocationSize;
+            baseInfo.Compressed |= ext.Compressed;
+            baseInfo.Sparse |= ext.Sparse;
+            baseInfo.HasPrimaryData |= ext.HasPrimaryData;
+            baseInfo.Reparse |= ext.Reparse;
+            baseInfo.Offline |= ext.Offline;
+        }
+
+        foreach (long recNo in extensionRecNos)
+        {
+            if (!entries.TryGetValue(recNo, out MftEntryInfo ext)) continue;
+            if (ext.BaseRecordNumber == 0 || ext.BaseRecordNumber == recNo) continue;
+            if (!entries.TryGetValue(ext.BaseRecordNumber, out MftEntryInfo baseInfo)) continue;
+            if (removed.Contains(ext.BaseRecordNumber)
+                || (baseInfo.BaseRecordNumber != 0 && baseInfo.BaseRecordNumber != ext.BaseRecordNumber))
+            {
+                (deferred ??= new List<long>(extensionRecNos.Count)).Add(recNo);
+                continue;
+            }
+
+            Fold(ref baseInfo, in ext);
+            entries[ext.BaseRecordNumber] = baseInfo;
+            removed.Add(recNo);
+        }
+
+        // One final sweep: follow each deferred chain to its ultimate base (cycle-guarded)
+        // so ext -> ext -> base folds without re-scanning the whole list.
+        if (deferred is not null)
+        {
+            foreach (long recNo in deferred)
             {
                 if (removed.Contains(recNo)) continue;
                 if (!entries.TryGetValue(recNo, out MftEntryInfo ext)) continue;
-                if (ext.BaseRecordNumber == 0 || ext.BaseRecordNumber == recNo) continue;
-                if (removed.Contains(ext.BaseRecordNumber) || !entries.TryGetValue(ext.BaseRecordNumber, out MftEntryInfo baseInfo))
-                    continue;
-
-                baseInfo.LogicalSize = Math.Max(baseInfo.LogicalSize, ext.LogicalSize);
-                // The lowest-VCN-zero record contains the complete primary-stream
-                // allocation. Never add continuation records to it.
-                baseInfo.DataAllocatedSize = Math.Max(baseInfo.DataAllocatedSize, ext.DataAllocatedSize);
-                baseInfo.AdsAllocatedSize += ext.AdsAllocatedSize;
-                baseInfo.IndexAllocationSize += ext.IndexAllocationSize;
-                baseInfo.Compressed |= ext.Compressed;
-                baseInfo.Sparse |= ext.Sparse;
-                baseInfo.HasPrimaryData |= ext.HasPrimaryData;
-                entries[ext.BaseRecordNumber] = baseInfo;
-
+                long ultimate = ext.BaseRecordNumber;
+                if (ultimate == 0 || ultimate == recNo) continue;
+                for (int hop = 0; hop < 8; hop++)
+                {
+                    if (!entries.TryGetValue(ultimate, out MftEntryInfo cur)) break;
+                    if (cur.BaseRecordNumber == 0 || cur.BaseRecordNumber == ultimate) break;
+                    ultimate = cur.BaseRecordNumber;
+                }
+                if (ultimate == recNo || removed.Contains(ultimate)) continue;
+                if (!entries.TryGetValue(ultimate, out MftEntryInfo baseInfo)) continue;
+                Fold(ref baseInfo, in ext);
+                entries[ultimate] = baseInfo;
                 removed.Add(recNo);
-                changed = true;
             }
         }
 
         foreach (long recNo in removed) entries.Remove(recNo);
     }
 
-    /// <summary>
-    /// Reads $MFT record #0 from the known start LCN and decodes its cluster-run list so
-    /// fragmented MFTs are read correctly. Falls back to a single sequential extent when
-    /// decoding is not possible (degenerate volumes).
-    /// </summary>
     private static unsafe List<(long StartLcn, ulong Clusters)> DiscoverMftExtents(
         IntPtr hVolume, in NtfsNative.NtfsVolumeDataBuffer vol, ulong validLength)
     {
+        if (vol.BytesPerCluster == 0)
+            throw new IOException("Invalid NTFS geometry: zero bytes per cluster.");
+        if (vol.MftStartLcn >= vol.TotalClusters)
+            throw new IOException(
+                $"Invalid MFT start LCN {vol.MftStartLcn} (total clusters {vol.TotalClusters}).");
+        ulong availClusters = vol.TotalClusters - vol.MftStartLcn; // >= 1 from the check above
+
         uint recordSize = vol.BytesPerFileRecordSegment;
         var probe = GC.AllocateUninitializedArray<byte>((int)recordSize * 8); // first few records
 
@@ -306,11 +399,14 @@ public sealed class NtfsMftScanner : IDiskScanner
             }
         }
 
-        // Degenerate fallback: treat the whole MFT as one contiguous span from its start LCN.
+        // Degenerate fallback: treat the whole MFT as one contiguous span from its start
+        // LCN, clamped to the clusters that actually exist. Zero means nothing to read —
+        // return empty instead of forcing a past-the-end cluster.
         ulong fallbackClusters = Math.Min(
             (validLength + vol.BytesPerCluster - 1) / vol.BytesPerCluster,
-            vol.TotalClusters - vol.MftStartLcn);
-        return new List<(long, ulong)> { ((long)vol.MftStartLcn, Math.Max(fallbackClusters, 1)) };
+            availClusters);
+        if (fallbackClusters == 0) return new List<(long, ulong)>();
+        return new List<(long, ulong)> { ((long)vol.MftStartLcn, fallbackClusters) };
     }
 
     private static readonly string[] SystemNames =
@@ -359,6 +455,12 @@ public sealed class NtfsMftScanner : IDiskScanner
             long parentRec = unchecked((long)e.ParentRecordNumber);
             if (parentRec != recNo && nodes.TryGetValue(parentRec, out FsNode? parent))
             {
+                // Never descend into reparse-point directories (junctions/symlinks):
+                // GenericScanner doesn't enumerate inside them, so attaching their
+                // contents here would double-count. Left detached = invisible, same as generic.
+                if ((parent.Flags & (NodeFlags.Directory | NodeFlags.ReparsePoint))
+                    == (NodeFlags.Directory | NodeFlags.ReparsePoint))
+                    continue;
                 parent.AddChild(node);
             }
             else if (parentRec == recNo)
@@ -393,6 +495,8 @@ public sealed class NtfsMftScanner : IDiskScanner
 
     private static void ApplyInfo(FsNode node, in MftEntryInfo e, uint clusterSize)
     {
+        if (e.Reparse) node.Flags |= NodeFlags.ReparsePoint;
+
         if (e.IsDirectory)
         {
             node.Flags |= NodeFlags.Directory;
@@ -408,6 +512,14 @@ public sealed class NtfsMftScanner : IDiskScanner
 
             if (e.Compressed) node.Flags |= NodeFlags.Compressed;
             if (e.Sparse) node.Flags |= NodeFlags.SparseFile;
+
+            // Cloud placeholders aren't resident locally — their allocation numbers
+            // describe remote content. Mirrors GenericScanner.ApplyAttributes.
+            if (e.Offline)
+            {
+                node.Flags |= NodeFlags.CloudPlaceholder;
+                node.AllocatedSize = 0;
+            }
         }
 
         // Hardlinks: sizes counted once at the canonical (first-seen) link location;

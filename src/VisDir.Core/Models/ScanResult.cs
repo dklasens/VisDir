@@ -12,13 +12,13 @@ public sealed record ScanProgress(
     string Phase = "Scanning");
 
 [SuppressMessage("ReSharper", "UnusedAutoPropertyAccessor.Global")]
-public sealed class ScanStats
+public sealed record ScanStats
 {
-    public long FileCount;
-    public long DirectoryCount;
-    public long ErrorCount;
-    public ulong BytesSeen;
-    public double ElapsedMs;
+    public long FileCount { get; init; }
+    public long DirectoryCount { get; init; }
+    public long ErrorCount { get; init; }
+    public ulong BytesSeen { get; init; }
+    public double ElapsedMs { get; init; }
 }
 
 public sealed class ScanResult

@@ -17,8 +17,6 @@
         <SolidColorBrush x:Key="ProgressTrackBrush" Color="#384058"/>
         <SolidColorBrush x:Key="OverlayBrush" Color="#EA222638"/>
         <SolidColorBrush x:Key="AccentTextBrush" Color="#FFFFFF"/>
-        <DropShadowEffect x:Key="PopupShadow" BlurRadius="16" ShadowDepth="3" Direction="270" Opacity="0.5" Color="#000000"/>
-        <DropShadowEffect x:Key="ModalShadow" BlurRadius="28" ShadowDepth="6" Direction="270" Opacity="0.65" Color="#000000"/>
         
         <Style TargetType="TextBlock"><Setter Property="Foreground" Value="{DynamicResource TextBrush}"/></Style>
         <Style x:Key="Dim" TargetType="TextBlock"><Setter Property="Foreground" Value="{DynamicResource DimBrush}"/></Style>
@@ -100,7 +98,7 @@
                                       Content="{TemplateBinding SelectionBoxItem}" ContentTemplate="{TemplateBinding SelectionBoxItemTemplate}"/>
                     <Popup x:Name="PART_Popup" Placement="Bottom" PlacementTarget="{Binding ElementName=Toggle}" IsOpen="{TemplateBinding IsDropDownOpen}" AllowsTransparency="True" Focusable="False">
                         <Grid Margin="0,3,12,14" Background="Transparent">
-                            <Border Width="{Binding ActualWidth, ElementName=Toggle}" Background="{DynamicResource InputBrush}" BorderBrush="{DynamicResource BorderBrush}" BorderThickness="1" CornerRadius="6" Effect="{StaticResource PopupShadow}">
+                            <Border Width="{Binding ActualWidth, ElementName=Toggle}" Background="{DynamicResource InputBrush}" BorderBrush="{DynamicResource BorderBrush}" BorderThickness="1" CornerRadius="6">
                                 <ScrollViewer MaxHeight="320" Margin="4"><ItemsPresenter/></ScrollViewer>
                             </Border>
                         </Grid>
@@ -136,7 +134,7 @@
                     <ControlTemplate TargetType="ContextMenu">
                         <Border Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}"
                                 BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="8"
-                                Padding="{TemplateBinding Padding}" Effect="{StaticResource PopupShadow}">
+                                Padding="{TemplateBinding Padding}">
                             <StackPanel IsItemsHost="True" KeyboardNavigation.DirectionalNavigation="Cycle"/>
                         </Border>
                     </ControlTemplate>
@@ -355,9 +353,8 @@
                         </sb:SunburstControl.ContextMenu>
                     </sb:SunburstControl>
 
-                    <!-- Scanning Overlay -->
                     <Grid x:Name="ScanOverlay" Background="{DynamicResource OverlayBrush}" Visibility="Collapsed">
-                        <Border Background="{DynamicResource CardBrush}" BorderBrush="{DynamicResource BorderBrush}" BorderThickness="1" CornerRadius="12" Padding="28,24" HorizontalAlignment="Center" VerticalAlignment="Center" Effect="{StaticResource PopupShadow}" MinWidth="320">
+                        <Border Background="{DynamicResource CardBrush}" BorderBrush="{DynamicResource BorderBrush}" BorderThickness="1" CornerRadius="12" Padding="28,24" HorizontalAlignment="Center" VerticalAlignment="Center" MinWidth="320">
                             <StackPanel HorizontalAlignment="Center">
                                 <TextBlock Text="Scanning Target…" FontSize="16" FontWeight="SemiBold" HorizontalAlignment="Center"/>
                                 <TextBlock x:Name="ScanOverlayTarget" Style="{StaticResource Dim}" FontSize="12" Margin="0,6,0,16" HorizontalAlignment="Center" TextTrimming="CharacterEllipsis" MaxWidth="280"/>
@@ -417,25 +414,14 @@
                                 <ListBox.ItemTemplate>
                                     <DataTemplate>
                                         <Grid Margin="6,5" ToolTip="{Binding ToolTipText}">
-                                            <Grid.RowDefinitions>
-                                                <RowDefinition Height="Auto"/>
-                                                <RowDefinition Height="Auto"/>
-                                            </Grid.RowDefinitions>
-                                            
-                                            <!-- Item Row: Dot + Name + Right-Aligned Size -->
-                                            <Grid>
-                                                <Grid.ColumnDefinitions>
-                                                    <ColumnDefinition Width="16"/>
-                                                    <ColumnDefinition Width="*"/>
-                                                    <ColumnDefinition Width="Auto"/>
-                                                </Grid.ColumnDefinitions>
-                                                <Border Width="8" Height="8" CornerRadius="4" Background="{Binding ChipBrush}" VerticalAlignment="Center"/>
-                                                <TextBlock Grid.Column="1" Text="{Binding Name}" FontSize="12.5" Foreground="{Binding TextBrush}" TextTrimming="CharacterEllipsis" VerticalAlignment="Center" Margin="2,0,0,0"/>
-                                                <TextBlock Grid.Column="2" Text="{Binding SizeText}" FontSize="12" Foreground="{Binding SizeBrush}" FontWeight="SemiBold" VerticalAlignment="Center" Margin="10,0,4,0"/>
-                                            </Grid>
-
-                                            <!-- Subtle Proportional Bar Gauge -->
-                                            <ProgressBar Grid.Row="1" Height="2.5" Margin="18,4,4,1" Minimum="0" Maximum="1" Value="{Binding BarFraction, Mode=OneWay}" Foreground="{Binding ChipBrush}" Background="{DynamicResource ProgressTrackBrush}" BorderThickness="0"/>
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="16"/>
+                                                <ColumnDefinition Width="*"/>
+                                                <ColumnDefinition Width="Auto"/>
+                                            </Grid.ColumnDefinitions>
+                                            <Border Width="8" Height="8" CornerRadius="4" Background="{Binding ChipBrush}" VerticalAlignment="Center"/>
+                                            <TextBlock Grid.Column="1" Text="{Binding Name}" FontSize="12.5" Foreground="{Binding TextBrush}" TextTrimming="CharacterEllipsis" VerticalAlignment="Center" Margin="2,0,0,0"/>
+                                            <TextBlock Grid.Column="2" Text="{Binding SizeText}" FontSize="12" Foreground="{Binding SizeBrush}" FontWeight="SemiBold" VerticalAlignment="Center" Margin="10,0,4,0"/>
                                         </Grid>
                                     </DataTemplate>
                                 </ListBox.ItemTemplate>
@@ -465,9 +451,8 @@
 
             <!-- 3. UPDATE MODAL OVERLAY -->
             <Grid x:Name="UpdateOverlay" Background="{DynamicResource OverlayBrush}" Visibility="Collapsed"
-                  KeyboardNavigation.TabNavigation="Cycle" FocusManager.IsFocusScope="True"
                   AutomationProperties.Name="VisDir update dialog">
-                <Border Background="{DynamicResource InputBrush}" BorderBrush="{DynamicResource BorderBrush}" BorderThickness="1" CornerRadius="12" Padding="28,24" HorizontalAlignment="Center" VerticalAlignment="Center" Effect="{StaticResource PopupShadow}" MinWidth="440" MaxWidth="520">
+                <Border Background="{DynamicResource InputBrush}" BorderBrush="{DynamicResource BorderBrush}" BorderThickness="1" CornerRadius="12" Padding="28,24" HorizontalAlignment="Center" VerticalAlignment="Center" MinWidth="440" MaxWidth="520">
                     <StackPanel>
                         <DockPanel LastChildFill="True" Margin="0,0,0,14">
                             <Button DockPanel.Dock="Right" Style="{StaticResource NavButton}" Content="✕" FontSize="14" Width="28" Height="28" Click="OnCloseUpdateOverlayClick" ToolTip="Close"/>

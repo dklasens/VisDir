@@ -65,6 +65,9 @@ public partial class MainWindow : Window
     private readonly Stack<FsNode> _forwardHistory = new();
     private bool _navigatingHistory;
     private bool _suppressFilterRebuild;
+    private readonly DispatcherTimer _filterDebounce;
+    private Dictionary<FsNode, FileItemView> _fileItemByNode = new(ReferenceEqualityComparer.Instance);
+    private long _lastProgressUiMs; // 10Hz gate for scan progress (Environment.TickCount64)
 
     public MainWindow()
     {
@@ -82,27 +85,25 @@ public partial class MainWindow : Window
         };
         _driveRefreshTimer.Start();
 
-        _scanner.ProgressChanged += p => Dispatcher.Invoke(() =>
+        _filterDebounce = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(150) };
+        _filterDebounce.Tick += (_, _) =>
         {
-            if (p is >= 0 and < 1)
-            {
-                ScanProgressBar.IsIndeterminate = false;
-                ScanProgressBar.Value = p;
-            }
-            else
-            {
-                ScanProgressBar.IsIndeterminate = true;
-            }
-        });
-        _scanner.StatusChanged += s => Dispatcher.Invoke(() => ScanPhaseText.Text = s);
-        _scanner.Completed += r => Dispatcher.Invoke(() => OnScanCompleted(r));
-        _scanner.Failed += msg => Dispatcher.Invoke(() =>
+            _filterDebounce.Stop();
+            if (!_suppressFilterRebuild) RebuildFileList();
+        };
+
+        // Scanner callbacks arrive on worker threads: never block them (BeginInvoke),
+        // and coalesce progress to 10Hz (ScanService also gates at the source).
+        _scanner.ProgressChanged += OnScanProgressThrottled;
+        _scanner.StatusChanged += s => Dispatcher.BeginInvoke(() => ScanPhaseText.Text = s);
+        _scanner.Completed += r => Dispatcher.BeginInvoke(() => { _ = OnScanCompletedAsync(r); });
+        _scanner.Failed += msg => Dispatcher.BeginInvoke(() =>
         {
             ScanOverlay.Visibility = Visibility.Collapsed;
             MessageBox.Show(this, msg, "Scan Failed", MessageBoxButton.OK, MessageBoxImage.Warning);
             if (_result is null) ShowLandingView();
         });
-        _scanner.Cancelled += () => Dispatcher.Invoke(() =>
+        _scanner.Cancelled += () => Dispatcher.BeginInvoke(() =>
         {
             ScanOverlay.Visibility = Visibility.Collapsed;
             if (_result is null) ShowLandingView();
@@ -110,11 +111,10 @@ public partial class MainWindow : Window
 
         Burst.HoveredChanged += node => Dispatcher.Invoke(() =>
         {
+            // Hover drives the center readout only; the list no longer follows it.
             FsNode? target = node ?? _selectedNode ?? _viewRoot;
             UpdateSelectedNodeInfo(target);
-            SyncListHover(node);
         });
-
         Burst.NodeClicked += node => Dispatcher.Invoke(() =>
         {
             _selectedNode = node;
@@ -136,6 +136,7 @@ public partial class MainWindow : Window
         {
             SystemParameters.StaticPropertyChanged -= OnSystemParametersChanged;
             _driveRefreshTimer.Stop();
+            _filterDebounce.Stop();
             _updateDownloadCts?.Cancel();
             _updateDownloadCts?.Dispose();
             _scanner.Dispose();
@@ -285,6 +286,15 @@ public partial class MainWindow : Window
 
     private void ShowLandingView()
     {
+        _result = null;
+        _viewRoot = null;
+        _selectedNode = null;
+        _backHistory.Clear();
+        _forwardHistory.Clear();
+        Burst.ViewRoot = null;
+        Burst.Volume = null;
+        ChildrenList.ItemsSource = null;
+        _fileItemByNode.Clear();
         LandingPanel.Visibility = Visibility.Visible;
         ContentShell.Visibility = Visibility.Collapsed;
         EngineBadge.Visibility = Visibility.Collapsed;
@@ -292,6 +302,7 @@ public partial class MainWindow : Window
         RescanButton.Visibility = Visibility.Collapsed;
         BreadcrumbBar.Children.Clear();
         DisksRootButton.IsEnabled = false;
+        UpdateHistoryButtons();
         RefreshDrives();
     }
 
@@ -399,10 +410,32 @@ public partial class MainWindow : Window
         }
     }
 
-    private void OnScanCompleted(ScanResult result)
+    /// <summary>10Hz-coalesced progress: drops bursts instead of queueing UI work, never blocks the worker.</summary>
+    private void OnScanProgressThrottled(double fraction)
+    {
+        long now = Environment.TickCount64;
+        if (now - Interlocked.Read(ref _lastProgressUiMs) < 100) return;
+        Interlocked.Exchange(ref _lastProgressUiMs, now);
+        Dispatcher.BeginInvoke(() =>
+        {
+            // Volume-based fractions sit near zero for most of a folder scan (bytes seen vs whole-disk
+            // used space), which read as a frozen bar. Only go determinate on a real sweep (MFT read);
+            // otherwise the marquee plus live file/folder counts carry the progress signal.
+            if (fraction is >= 0.02 and < 1)
+            {
+                ScanProgressBar.IsIndeterminate = false;
+                ScanProgressBar.Value = fraction;
+            }
+            else
+            {
+                ScanProgressBar.IsIndeterminate = true;
+            }
+        });
+    }
+
+    private async Task OnScanCompletedAsync(ScanResult result)
     {
         _result = result;
-        ScanOverlay.Visibility = Visibility.Collapsed;
 
         EngineBadge.Visibility = Visibility.Visible;
         EngineBadgeText.Text = result.EngineName?.Trim().ToLowerInvariant() switch
@@ -424,11 +457,17 @@ public partial class MainWindow : Window
             ScanWarningBadge.Visibility = Visibility.Collapsed;
         }
 
-        Burst.Volume = result.Volume;
         _backHistory.Clear();
         _forwardHistory.Clear();
         UpdateHistoryButtons();
+
+        // First layout builds off-UI-thread (FsNode/SunburstNode are free-threaded);
+        // the overlay stays indeterminate until NavigateInto returns.
+        ScanProgressBar.IsIndeterminate = true;
+        Burst.PendingLayout = await Task.Run(() => SunburstLayout.Build(result.Root, maxDepth: SunburstControl.MaxVisibleDepth));
+        Burst.Volume = result.Volume;
         NavigateInto(result.Root, recordHistory: false);
+        ScanOverlay.Visibility = Visibility.Collapsed;
     }
 
     private void NavigateInto(FsNode node, bool recordHistory = true)
@@ -442,6 +481,9 @@ public partial class MainWindow : Window
             UpdateHistoryButtons();
         }
 
+        // Layout rebuilds lazily per navigation, depth-capped by SunburstLayout: only the
+        // entered subtree is built, and only down to MaxVisibleDepth.
+        _filterDebounce.Stop();
         ClearSearchFilter();
         _viewRoot = node;
         _selectedNode = node;
@@ -555,8 +597,13 @@ public partial class MainWindow : Window
             if (isVisibleWedge) rankOf[child] = branchCount++;
         }
 
+        // One frozen brush per visible branch; rows share instances instead of allocating per row.
+        int brushCount = Math.Max(branchCount, 1);
+        var branchBrushes = new Brush[brushCount];
+        for (int i = 0; i < brushCount; i++) branchBrushes[i] = Palette.BrushForBranch(i, brushCount, 1);
+
         // Set active folder dot color
-        CurrentFolderDot.Background = Palette.BrushForBranch(0, Math.Max(branchCount, 1), 1);
+        CurrentFolderDot.Background = branchBrushes[0];
 
         ulong largest = nodes.Count > 0 ? nodes.Max(n => n.TotalAllocated) : 0;
         var items = new List<FileItemView>(nodes.Count);
@@ -581,7 +628,7 @@ public partial class MainWindow : Window
 
             items.Add(new FileItemView(
                 node,
-                ChipBrushFor(node, rankOf, branchCount),
+                ChipBrushFor(node, rankOf, branchBrushes),
                 normalTextBrush,
                 normalTextBrush,
                 largest > 0 ? (double)node.TotalAllocated / largest : 0,
@@ -608,7 +655,13 @@ public partial class MainWindow : Window
                 isAggregated: true));
         }
 
+        FsNode? previouslySelected = (ChildrenList.SelectedItem as FileItemView)?.Node;
+        var byNode = new Dictionary<FsNode, FileItemView>(items.Count, ReferenceEqualityComparer.Instance);
+        foreach (FileItemView item in items) byNode[item.Node] = item;
+        _fileItemByNode = byNode;
         ChildrenList.ItemsSource = items;
+        if (previouslySelected is not null && byNode.TryGetValue(previouslySelected, out FileItemView? restore))
+            ChildrenList.SelectedItem = restore;
         if (items.Count == 0)
         {
             EmptyListText.Text = query.Length == 0 ? "This folder is empty" : $"No matches for \"{query}\"";
@@ -620,10 +673,11 @@ public partial class MainWindow : Window
         }
     }
 
-    private static Brush ChipBrushFor(FsNode node, IReadOnlyDictionary<FsNode, int> rankOf, int branchCount)
+    private static Brush ChipBrushFor(FsNode node, IReadOnlyDictionary<FsNode, int> rankOf, Brush[] branchBrushes)
     {
-        if (!rankOf.TryGetValue(node, out int rank)) return Palette.AggregatedBrush;
-        return Palette.BrushForBranch(rank, Math.Max(branchCount, 1), 1);
+        if (!rankOf.TryGetValue(node, out int rank) || (uint)rank >= (uint)branchBrushes.Length)
+            return Palette.AggregatedBrush;
+        return branchBrushes[rank];
     }
 
     private void UpdateSelectedNodeInfo(FsNode? node)
@@ -648,31 +702,13 @@ public partial class MainWindow : Window
         SelectedInfoBorder.Visibility = Visibility.Visible;
     }
 
-    private void SyncListHover(FsNode? node)
-    {
-        if (node is null || ChildrenList.ItemsSource is not IEnumerable<FileItemView> items) return;
-        foreach (FileItemView item in items)
-        {
-            if (ReferenceEquals(item.Node, node))
-            {
-                ChildrenList.ScrollIntoView(item);
-                return;
-            }
-        }
-    }
-
     private void SyncListSelection(FsNode node)
     {
-        if (ChildrenList.ItemsSource is not IEnumerable<FileItemView> items) return;
-        foreach (FileItemView item in items)
+        if (_fileItemByNode.TryGetValue(node, out FileItemView? item))
         {
-            if (ReferenceEquals(item.Node, node))
-            {
-                if (!ReferenceEquals(ChildrenList.SelectedItem, item))
-                    ChildrenList.SelectedItem = item;
-                ChildrenList.ScrollIntoView(item);
-                return;
-            }
+            if (!ReferenceEquals(ChildrenList.SelectedItem, item))
+                ChildrenList.SelectedItem = item;
+            ChildrenList.ScrollIntoView(item);
         }
     }
 
@@ -680,7 +716,9 @@ public partial class MainWindow : Window
     {
         SearchPlaceholder.Visibility = string.IsNullOrEmpty(SearchBox.Text) ? Visibility.Visible : Visibility.Collapsed;
         ClearSearchButton.Visibility = string.IsNullOrEmpty(SearchBox.Text) ? Visibility.Collapsed : Visibility.Visible;
-        if (IsInitialized && !_suppressFilterRebuild) RebuildFileList();
+        if (!IsInitialized || _suppressFilterRebuild) return;
+        _filterDebounce.Stop();
+        _filterDebounce.Start();
     }
 
     private void OnClearSearchClick(object sender, RoutedEventArgs e)
@@ -805,6 +843,8 @@ public partial class MainWindow : Window
 
         if (e.Key == Key.Back && Keyboard.FocusedElement is not TextBox)
         {
+            // Burst handles Back itself (go up); a window-level Back here would navigate twice.
+            if (Burst.IsKeyboardFocused || ReferenceEquals(Keyboard.FocusedElement, Burst)) return;
             OnBackClick(sender, e);
             e.Handled = true;
             return;

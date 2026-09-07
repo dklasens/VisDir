@@ -27,8 +27,9 @@ public static class TreeOps
             {
                 foreach (FsNode c in children)
                 {
-                    tl += c.TotalLogical;
-                    ta += c.TotalAllocated;
+                    // Saturating add: corrupt/huge subtrees pin at ulong.MaxValue instead of wrapping.
+                    tl = tl > ulong.MaxValue - c.TotalLogical ? ulong.MaxValue : tl + c.TotalLogical;
+                    ta = ta > ulong.MaxValue - c.TotalAllocated ? ulong.MaxValue : ta + c.TotalAllocated;
                 }
                 if (children.Count > 1)
                 {

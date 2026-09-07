@@ -1,6 +1,8 @@
 [CmdletBinding()]
 param(
     [string] $Version,
+    [ValidateSet('win-x64', 'win-arm64')]
+    [string] $Runtime = 'win-x64',
     [string] $WixPath,
     [switch] $NoRestore,
     [switch] $SkipPublish
@@ -14,11 +16,9 @@ if ([string]::IsNullOrWhiteSpace($Version)) {
 }
 if ($Version -notmatch '^\d+\.\d+\.\d+$') { throw "Invalid installer version: $Version" }
 if (-not $SkipPublish) {
-    if ($NoRestore) {
-        & (Join-Path $repoRoot 'scripts\publish.ps1') -Runtime win-x64 -Configuration Release -NoRestore
-    } else {
-        & (Join-Path $repoRoot 'scripts\publish.ps1') -Runtime win-x64 -Configuration Release
-    }
+    $publishArgs = @('-Runtime', $Runtime, '-Configuration', 'Release')
+    if ($NoRestore) { $publishArgs += '-NoRestore' }
+    & (Join-Path $repoRoot 'scripts\publish.ps1') @publishArgs
     if ($LASTEXITCODE -ne 0) { throw 'Publish failed.' }
 }
 
@@ -36,5 +36,6 @@ New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
 & $wixCommand build (Join-Path $PSScriptRoot 'VisDir.wxs') `
     -d "ProductVersion=$Version" `
     -d "RepoRoot=$repoRoot" `
-    -o (Join-Path $outputDir "VisDir-$Version-win-x64.msi")
+    -d "PublishTriple=$Runtime" `
+    -o (Join-Path $outputDir "VisDir-$Version-$Runtime.msi")
 if ($LASTEXITCODE -ne 0) { throw 'Installer build failed.' }

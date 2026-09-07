@@ -70,10 +70,22 @@ public static class Palette
         return SKColor.FromHsl(hue, sat * 100f, light * 100f);
     }
 
+    private static readonly Dictionary<(int BranchIndex, int BranchCount, int Depth), Brush> _brushCache = new();
+    private static readonly object _brushLock = new();
+
+    /// <summary>Frozen shared brush per (branch, count, depth). Frozen brushes are
+    /// free-threaded, so off-UI-thread layout rebuilds may call this safely.</summary>
     public static Brush BrushForBranch(int branchIndex, int branchCount, int depth = 1)
     {
-        SKColor sk = ColorForBranch(branchIndex, branchCount, depth, hovered: false);
-        return CreateFrozenBrush(sk.Red, sk.Green, sk.Blue);
+        var key = (branchIndex, branchCount, depth);
+        lock (_brushLock)
+        {
+            if (_brushCache.TryGetValue(key, out Brush? cached)) return cached;
+            SKColor sk = ColorForBranch(branchIndex, branchCount, depth, hovered: false);
+            Brush brush = CreateFrozenBrush(sk.Red, sk.Green, sk.Blue);
+            _brushCache[key] = brush;
+            return brush;
+        }
     }
 
     public static Brush AggregatedBrush { get; } = CreateFrozenBrush(0x52, 0x58, 0x6A);
@@ -92,5 +104,4 @@ public static class Palette
     public static readonly SKColor MetadataWedge = new(0x32, 0x37, 0x4B);
     public static readonly SKColor PlaceholderFile = new(0x52, 0x58, 0x6A);
     public static readonly SKColor ScannedVolume = SKColor.FromHsl(210f, 65f, 60f);
-    public static readonly SKColor LabelHalo = new(0x1A, 0x1D, 0x2B, 0xE0);
 }

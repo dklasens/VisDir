@@ -30,12 +30,9 @@ public static class SunburstLayout
 {
     public const double FullCircle = 2 * Math.PI;
 
-    /// <summary>
-    /// Builds angular layout for <paramref name="viewRoot"/>, starting at angle 0.
-    /// Children are already sorted descending by TotalAllocated (TreeOps.Finalize).
-    /// Sub-threshold children collapse into one aggregated wedge.
-    /// </summary>
-    public static SunburstNode Build(FsNode viewRoot, double minSweepRadians = 0.006)
+    /// <param name="maxDepth">Deepest ring to build. Must match SunburstControl.MaxVisibleDepth;
+    /// deeper subtrees rebuild lazily when the user navigates into them.</param>
+    public static SunburstNode Build(FsNode viewRoot, double minSweepRadians = 0.006, int maxDepth = 6)
     {
         var root = new SunburstNode
         {
@@ -44,15 +41,16 @@ public static class SunburstLayout
             Angle1 = FullCircle,
             Depth = 0,
         };
-        LayoutChildren(root, minSweepRadians);
+        LayoutChildren(root, minSweepRadians, maxDepth);
         AssignBranches(root);
         root.BranchIndex = -1;
         root.BranchCount = root.Children?.Count ?? 0;
         return root;
     }
 
-    private static void LayoutChildren(SunburstNode parent, double minSweep)
+    private static void LayoutChildren(SunburstNode parent, double minSweep, int maxDepth)
     {
+        if (parent.Depth + 1 > maxDepth) return;
         FsNode src = parent.Source;
         if (src.Children is not { Count: > 0 } kids) return;
 
@@ -130,7 +128,7 @@ public static class SunburstLayout
 
         parent.Children = built;
         foreach (SunburstNode child in built)
-            LayoutChildren(child, minSweep);
+            LayoutChildren(child, minSweep, maxDepth);
     }
 
     private static void AssignBranches(SunburstNode root)

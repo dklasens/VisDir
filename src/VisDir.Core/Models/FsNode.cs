@@ -21,6 +21,9 @@ public sealed class FsNode
 
     public void AddChild(FsNode child)
     {
+        ArgumentNullException.ThrowIfNull(child);
+        if (ReferenceEquals(child, this)) throw new ArgumentException("A node cannot be its own child.", nameof(child));
+        if (child.Parent is not null) throw new InvalidOperationException("Child already has a parent; re-parenting is not allowed.");
         child.Parent = this;
         (Children ??= new List<FsNode>()).Add(child);
     }
@@ -28,21 +31,20 @@ public sealed class FsNode
     public string GetPath()
     {
         if (Parent is null) return Name;
-        var sb = new System.Text.StringBuilder(260);
-        BuildPath(sb);
-        return sb.ToString();
-    }
-
-    private void BuildPath(System.Text.StringBuilder sb)
-    {
-        if (Parent is null)
+        var chain = new Stack<FsNode>();
+        for (FsNode? n = this; n is not null; n = n.Parent) chain.Push(n);
+        var sb = new System.Text.StringBuilder();
+        bool first = true;
+        foreach (FsNode n in chain)
         {
-            sb.Append(Name);
-            if (sb.Length > 0 && sb[sb.Length - 1] != '\\') sb.Append('\\');
-            return;
+            sb.Append(n.Name);
+            // Root always keeps its trailing backslash; deeper nodes only when directories.
+            if (first || n.IsDirectory)
+            {
+                if (sb.Length > 0 && sb[sb.Length - 1] != '\\') sb.Append('\\');
+            }
+            first = false;
         }
-        Parent.BuildPath(sb);
-        sb.Append(Name);
-        if (IsDirectory) sb.Append('\\');
+        return sb.ToString();
     }
 }

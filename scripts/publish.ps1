@@ -4,8 +4,15 @@ param(
     [string] $Runtime = 'win-x64',
     [ValidateSet('Debug', 'Release')]
     [string] $Configuration = 'Release',
+    [string] $Version = '',
     [switch] $NoRestore
 )
+
+if ([string]::IsNullOrWhiteSpace($Version)) {
+    [xml] $buildProps = Get-Content -LiteralPath (Join-Path $PSScriptRoot '..\Directory.Build.props')
+    $Version = [string]$buildProps.Project.PropertyGroup.VersionPrefix
+}
+if ($Version -notmatch '^\d+\.\d+\.\d+$') { throw "Invalid publish version: $Version" }
 
 $ErrorActionPreference = 'Stop'
 $repoRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
@@ -23,7 +30,8 @@ New-Item -ItemType Directory -Path $publishDir -Force | Out-Null
 $appProject = Join-Path $repoRoot 'src\VisDir.App\VisDir.App.csproj'
 $publishArguments = @(
     'publish', $appProject, '-c', $Configuration, '-r', $Runtime, '--self-contained', 'true',
-    '-p:PublishReadyToRun=true', '-p:PublishSingleFile=false', '-p:DebugType=None',
+    '-p:PublishReadyToRun=true', '-p:PublishSingleFile=false', '-p:DebugType=embedded',
+    "-p:Version=$Version",
     '-o', $publishDir
 )
 if ($NoRestore) { $publishArguments += '--no-restore' }
@@ -48,12 +56,12 @@ $checksums = Get-ChildItem -LiteralPath $publishDir -Recurse -File |
         "$hash  $relative"
     }
 $checksums | Set-Content -LiteralPath (Join-Path $publishDir $checksumName) -Encoding utf8
-
 foreach ($line in Get-Content -LiteralPath (Join-Path $publishDir $checksumName)) {
-    $parts = $line -split '  ', 2
-    $filePath = Join-Path $publishDir $parts[1].Replace('/', '\')
+    # Split from the right: the 64-hex hash is anchored left, the remainder is the file name (may contain spaces).
+    if ($line -notmatch '^([0-9a-fA-F]{64})\s+(.+)$') { throw "Invalid checksum line: $line" }
+    $filePath = Join-Path $publishDir $Matches[2].Replace('/', '\')
     $actual = (Get-FileHash -LiteralPath $filePath -Algorithm SHA256).Hash.ToLowerInvariant()
-    if ($actual -ne $parts[0]) { throw "Checksum verification failed for $($parts[1])" }
+    if ($actual -ne $Matches[1].ToLowerInvariant()) { throw "Checksum verification failed for $($Matches[2])" }
 }
 
 $zipPath = Join-Path $publishRoot "VisDir-$Runtime.zip"

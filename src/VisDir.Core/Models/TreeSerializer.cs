@@ -16,7 +16,7 @@ namespace VisDir.Core;
 public static class TreeSerializer
 {
     public const uint Magic = 0x52494456; // "VDIR" LE
-    public const uint Version = 2;
+    public const uint SnapshotVersion = 2;
     private const ulong MaxNodeCount = 100_000_000;
 
     public static void Write(Stream stream, ScanResult result)
@@ -24,7 +24,7 @@ public static class TreeSerializer
         using var bw = new BinaryWriter(stream, System.Text.Encoding.UTF8, leaveOpen: true);
 
         bw.Write(Magic);
-        bw.Write(Version);
+        bw.Write(SnapshotVersion);
 
         var v = result.Volume;
         WriteString(bw, v.RootPath);
@@ -42,8 +42,20 @@ public static class TreeSerializer
         bw.Write(result.Stats.BytesSeen);
         bw.Write(result.Stats.ElapsedMs);
 
-        long nodeCountPos = bw.BaseStream.Position;
-        bw.Write(0UL);
+        // Seekable streams keep the exact v2 layout: a zero placeholder patched after the walk.
+        // Non-seekable streams get the same bytes via a counting pre-pass (no seek-back needed).
+        long nodeCountPos = -1;
+        ulong upfrontCount = 0;
+        if (stream.CanSeek)
+        {
+            nodeCountPos = bw.BaseStream.Position;
+            bw.Write(0UL);
+        }
+        else
+        {
+            upfrontCount = CountNodes(result.Root);
+            bw.Write(upfrontCount);
+        }
 
         ulong count = 0;
         // Pre-order with explicit stack (children pushed reversed to preserve sorted order).
@@ -69,11 +81,34 @@ public static class TreeSerializer
                     stack.Push(kids[i]);
         }
 
-        long endPos = bw.BaseStream.Position;
-        bw.BaseStream.Seek(nodeCountPos, SeekOrigin.Begin);
-        bw.Write(count);
-        bw.BaseStream.Seek(endPos, SeekOrigin.Begin);
+        if (stream.CanSeek)
+        {
+            long endPos = bw.BaseStream.Position;
+            bw.BaseStream.Seek(nodeCountPos, SeekOrigin.Begin);
+            bw.Write(count);
+            bw.BaseStream.Seek(endPos, SeekOrigin.Begin);
+        }
+        else if (count != upfrontCount)
+        {
+            throw new InvalidDataException("Tree was modified while the snapshot was being written.");
+        }
         bw.Flush();
+    }
+
+    private static ulong CountNodes(FsNode root)
+    {
+        ulong count = 0;
+        var stack = new Stack<FsNode>();
+        stack.Push(root);
+        while (stack.Count > 0)
+        {
+            FsNode n = stack.Pop();
+            count++;
+            if (n.Children is { } kids)
+                for (int i = kids.Count - 1; i >= 0; i--)
+                    stack.Push(kids[i]);
+        }
+        return count;
     }
 
     private static void WriteString(BinaryWriter bw, string s)
@@ -124,7 +159,7 @@ public static class TreeSerializer
 
         if (br.ReadUInt32() != Magic) throw new InvalidDataException("Not a VisDir snapshot.");
         uint version = br.ReadUInt32();
-        if (version != Version)
+        if (version != SnapshotVersion)
         {
             string detail = version == 1
                 ? "Version 1 snapshots did not contain enough topology information and cannot be read safely."
@@ -146,6 +181,10 @@ public static class TreeSerializer
         long errorCount = br.ReadInt64();
         ulong bytesSeen = br.ReadUInt64();
         double elapsedMs = br.ReadDouble();
+        if (fileCount < 0 || directoryCount < 0 || errorCount < 0)
+            throw new InvalidDataException("Snapshot scan counts must be non-negative.");
+        if (double.IsNaN(elapsedMs) || double.IsInfinity(elapsedMs) || elapsedMs < 0)
+            throw new InvalidDataException("Snapshot elapsed time is invalid.");
 
         var volume = new VolumeInfo
         {
@@ -157,10 +196,12 @@ public static class TreeSerializer
             TotalBytes = total,
             FreeBytes = free,
         };
-
         ulong nodeCount = br.ReadUInt64();
         if (nodeCount is 0 or > MaxNodeCount)
             throw new InvalidDataException($"Snapshot node count {nodeCount:N0} is invalid.");
+
+        ushort knownFlagsMask = 0;
+        foreach (NodeFlags f in Enum.GetValues<NodeFlags>()) knownFlagsMask |= (ushort)f;
 
         FsNode? root = null;
         var parentStack = new Stack<(FsNode Node, uint RemainingChildren)>();
@@ -168,6 +209,8 @@ public static class TreeSerializer
         {
             ushort flagsRaw = br.ReadUInt16();
             br.ReadUInt16(); // reserved
+            if ((flagsRaw & ~knownFlagsMask) != 0)
+                throw new InvalidDataException($"Node {i:N0} has unknown flag bits (0x{flagsRaw:X4}).");
             long key = br.ReadInt64();
             ulong logical = br.ReadUInt64();
             ulong allocated = br.ReadUInt64();
@@ -211,6 +254,10 @@ public static class TreeSerializer
         if (root is null) throw new InvalidDataException("Snapshot contains no nodes.");
         if (parentStack.Count != 0)
             throw new InvalidDataException("Snapshot ended before all declared children were read.");
+
+        // Stored Total* values are not trusted: recompute them from self sizes (overwrite on
+        // drift) so corrupt totals can never surface, and re-establish TotalAllocated ordering.
+        TreeOps.Finalize(root);
 
         return new ScanResult
         {

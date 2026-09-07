@@ -21,6 +21,8 @@ public struct MftEntryInfo
     public int FileNameLinks;              // FILE_NAME attributes seen (hardlink count)
     public bool Compressed;
     public bool Sparse;
+    public bool Reparse;                 // FILE_ATTRIBUTE_REPARSE_POINT seen in SI or FILE_NAME
+    public bool Offline;                 // OFFLINE or RECALL_ON_* seen in SI or FILE_NAME (cloud placeholder)
 
     public MftEntryInfo() { }
 }
@@ -188,6 +190,10 @@ public static unsafe class NtfsRecordParser
 
             switch (type)
             {
+                case AttrStandardInformation:
+                    ParseStandardInformation(rec, off, attrLen, ref info);
+                    break;
+
                 case AttrFileName:
                     ParseFileName(rec, off, attrLen, ref info, ref bestNameRank);
                     break;
@@ -225,6 +231,10 @@ public static unsafe class NtfsRecordParser
 
         info.FileNameLinks++;
 
+        // Flags DWORD at value+0x38 (allocated/real sizes precede it; 0x42 minimum
+        // length already validated above, so this read is in bounds).
+        ApplyAttributeFlags(*(uint*)(v + 0x38), ref info);
+
         // Prefer WIN32 names over DOS-mangled ones; POSIX/BOTH acceptable.
         int rank = ns switch { 1 => 4, 3 => 3, 0 => 2, _ => 1 };
         if (rank <= bestNameRank && info.HasFileName) return;
@@ -232,6 +242,25 @@ public static unsafe class NtfsRecordParser
         info.Name = new string((char*)(v + 0x42), 0, nameLen);
         info.HasFileName = true;
         bestNameRank = rank;
+    }
+
+    private static void ParseStandardInformation(byte* rec, uint off, uint attrLen, ref MftEntryInfo info)
+    {
+        if (nonResidentCheck(rec, off)) return; // STANDARD_INFORMATION is always resident
+        uint valueOffset = *(ushort*)(rec + off + 0x14);
+        uint valueLength = *(uint*)(rec + off + 0x10);
+        if (valueOffset + valueLength > attrLen || valueLength < 0x24) return;
+        ApplyAttributeFlags(*(uint*)(rec + off + valueOffset + 0x20), ref info);
+    }
+
+    private static void ApplyAttributeFlags(uint attrs, ref MftEntryInfo info)
+    {
+        const uint REPARSE = 0x400;
+        const uint OFFLINE = 0x1000;
+        const uint RECALL_ON_OPEN = 0x40000;
+        const uint RECALL_ON_DATA_ACCESS = 0x400000;
+        if ((attrs & REPARSE) != 0) info.Reparse = true;
+        if ((attrs & (OFFLINE | RECALL_ON_OPEN | RECALL_ON_DATA_ACCESS)) != 0) info.Offline = true;
     }
 
     private static void ParseData(byte* rec, uint off, uint attrLen, bool nonResident, uint attrFlags, ref MftEntryInfo info)

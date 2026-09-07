@@ -16,6 +16,7 @@ public sealed class ScanService : IDisposable
     private string? _tempFile;
     private int _scanSequence;
     private int _activeScanId;
+    private long _lastProgressReportMs; // 10Hz gate for PROGRESS notifications (Environment.TickCount64)
     private readonly ConcurrentDictionary<int, byte> _cancelledScans = new();
 
     public event Action<double>? ProgressChanged;          // 0..1 estimate
@@ -39,9 +40,9 @@ public sealed class ScanService : IDisposable
         }
 
         _process?.Dispose();
-        _process = null;
         int scanId = Interlocked.Increment(ref _scanSequence);
         Volatile.Write(ref _activeScanId, scanId);
+        Interlocked.Exchange(ref _lastProgressReportMs, 0);
 
         string exe = Environment.ProcessPath!;
         string tempFile = Path.Combine(Path.GetTempPath(), $"visdir_{Guid.NewGuid():N}.vdir");
@@ -96,6 +97,10 @@ public sealed class ScanService : IDisposable
             if (e.Data.StartsWith("PROGRESS ", StringComparison.Ordinal))
             {
                 Dictionary<string, string> values = ParseValues(e.Data);
+                // Coalesce to 10Hz at the source; the UI also coalesces, and DONE always flushes.
+                long now = Environment.TickCount64;
+                if (now - Interlocked.Read(ref _lastProgressReportMs) < 100) return;
+                Interlocked.Exchange(ref _lastProgressReportMs, now);
                 double fraction = ParseDouble(values, "fraction", -1);
                 ProgressChanged?.Invoke(fraction);
                 long files = ParseLong(values, "files");
