@@ -22,8 +22,7 @@
 
   <Fragment>
     <ComponentGroup Id="PublishedFiles" Directory="INSTALLFOLDER">
-      <Files Include="$(var.RepoRoot)\artifacts\publish\$(var.PublishTriple)\**"
-             Exclude="*.sha256;*.pdb" />
+      <Files Include="$(var.RepoRoot)\artifacts\publish\$(var.PublishTriple)\**" />
     </ComponentGroup>
   </Fragment>
 
