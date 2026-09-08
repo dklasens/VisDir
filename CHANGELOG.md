@@ -3,6 +3,20 @@
 All notable changes to VisDir are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.2.3] - 2026-09-08
+
+### Fixed
+
+- Updater download genuinely fixed: v1.2.1 chased concurrent temp paths, but
+  the full progress bar showed the bytes always landed and the failure came
+  after — at the final rename, which needs DELETE access that a just-finished
+  antivirus/indexer scan withholds. The artifact is now verified and used in
+  place (no rename); lock retries cover slow scans (sharing and denied,
+  ~11 s envelope); the finished archive is cleaned up after staging.
+- Download failures now log type, HResult and stack to
+  `%TEMP%\VisDir\Updates\download-error.log` and show the error kind in the
+  dialog, so any recurrence is diagnosable without guessing.
+
 ## [1.2.2] - 2026-09-08
 
 ### Fixed

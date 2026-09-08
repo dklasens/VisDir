@@ -47,4 +47,48 @@ public class UpdaterDownloadPathTests
             UpdateService.WithFileLockRetryAsync<string>(
                 () => throw new InvalidDataException("nope"), CancellationToken.None));
     }
+
+    [Fact]
+    public async Task FileLockRetry_BeatsRealHeldReadHandle()
+    {
+        // Simulates an antivirus/indexer holding the finished file: exclusive open
+        // fails until the holder releases, then the retry envelope must succeed.
+        string path = Path.Combine(Path.GetTempPath(), $"visdir-locktest-{Guid.NewGuid():N}.bin");
+        await File.WriteAllTextAsync(path, "payload");
+        try
+        {
+            using var locker = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+            var releaser = Task.Run(async () =>
+            {
+                await Task.Delay(800);
+                locker.Dispose();
+            });
+            using var winner = await UpdateService.WithFileLockRetryAsync(
+                () => new FileStream(path, FileMode.Open, FileAccess.Write, FileShare.None),
+                CancellationToken.None);
+            await releaser;
+            Assert.True(winner.CanWrite);
+        }
+        finally
+        {
+            UpdateService.TryDeleteFileWithRetry(path);
+            Assert.False(File.Exists(path));
+        }
+    }
+
+    [Fact]
+    public async Task TryDeleteFileWithRetry_RemovesAfterRelease()
+    {
+        string path = Path.Combine(Path.GetTempPath(), $"visdir-deltest-{Guid.NewGuid():N}.bin");
+        await File.WriteAllTextAsync(path, "payload");
+        var locker = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+        var releaser = Task.Run(async () =>
+        {
+            await Task.Delay(300);
+            locker.Dispose();
+        });
+        UpdateService.TryDeleteFileWithRetry(path);
+        await releaser;
+        Assert.False(File.Exists(path));
+    }
 }

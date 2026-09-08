@@ -210,8 +210,12 @@ public sealed partial class UpdateService
                     Convert.FromHexString(actualHash), Convert.FromHexString(release.Sha256)))
                 throw new InvalidDataException("The downloaded update failed SHA-256 verification.");
 
-            await WithFileLockRetryAsync(() => { File.Move(partialPath, zipPath, overwrite: true); return true; }, ct).ConfigureAwait(false);
-            return zipPath;
+            // No rename: the artifact is verified and used in place at its unique
+            // partial path. A same-volume rename needs DELETE access, which a
+            // just-finished scanner (antivirus/indexer) deterministically withholds
+            // on some machines; reads and extraction do not care about the name.
+            // Leftovers are swept by CleanupStalePartials.
+            return partialPath;
         }
         catch
         {
@@ -272,6 +276,7 @@ public sealed partial class UpdateService
             startInfo.ArgumentList.Add(argument);
 
         _ = Process.Start(startInfo) ?? throw new InvalidOperationException("The update helper could not be started.");
+        TryDeleteFileWithRetry(zipPath); // artifact served its purpose; sweeper covers a lingering lock
         Application.Current.Shutdown();
     }
 
@@ -615,12 +620,16 @@ public sealed partial class UpdateService
 
     private const int SharingViolationHResult = unchecked((int)0x80070020);
 
-    private static bool IsSharingViolation(IOException ex) => ex.HResult == SharingViolationHResult;
+    // Scan locks surface as sharing violations (held read handle) or as denied
+    // (held handle without delete share on rename/delete). Genuine ACL denials
+    // simply resurface after the envelope; nothing else is retried.
+    private static bool IsTransientFileLock(Exception ex) =>
+        (ex is IOException io && io.HResult == SharingViolationHResult) || ex is UnauthorizedAccessException;
 
-    /// <summary>Retries file open/move across transient locks (second instance, AV/indexer).</summary>
+    /// <summary>Retries file ops across scan locks (sharing violation or denied).</summary>
     internal static async Task<T> WithFileLockRetryAsync<T>(Func<T> open, CancellationToken ct)
     {
-        const int maxAttempts = 4;
+        const int maxAttempts = 7;
         for (int attempt = 0; ; attempt++)
         {
             ct.ThrowIfCancellationRequested();
@@ -628,9 +637,9 @@ public sealed partial class UpdateService
             {
                 return open();
             }
-            catch (IOException ex) when (IsSharingViolation(ex) && attempt + 1 < maxAttempts)
+            catch (Exception ex) when (IsTransientFileLock(ex) && attempt + 1 < maxAttempts)
             {
-                await Task.Delay(250 << attempt, ct).ConfigureAwait(false);
+                await Task.Delay(Math.Min(250 << attempt, 4000), ct).ConfigureAwait(false);
             }
         }
     }
@@ -656,6 +665,39 @@ public sealed partial class UpdateService
     private static void TryDeleteFile(string path)
     {
         try { if (File.Exists(path)) File.Delete(path); } catch { }
+    }
+
+    /// <summary>Best-effort delete across a lingering scan lock; gives up quietly (sweeper covers).</summary>
+    internal static void TryDeleteFileWithRetry(string path)
+    {
+        for (int attempt = 0; attempt < 4; attempt++)
+        {
+            try
+            {
+                if (!File.Exists(path)) return;
+                File.Delete(path);
+                return;
+            }
+            catch (Exception ex) when (IsTransientFileLock(ex) && attempt < 3)
+            {
+                Thread.Sleep(250 << attempt);
+            }
+            catch { return; }
+        }
+    }
+
+    /// <summary>Appends a download failure (type, HResult, stack) for diagnosis; never throws.</summary>
+    internal static void LogDownloadError(Exception ex)
+    {
+        try
+        {
+            string dir = GetUpdateTempRoot();
+            Directory.CreateDirectory(dir);
+            File.AppendAllText(
+                Path.Combine(dir, "download-error.log"),
+                $"{DateTimeOffset.UtcNow:o} {ex}{Environment.NewLine}");
+        }
+        catch { }
     }
 
     internal static string UpdateScriptForTests => UpdateScript;

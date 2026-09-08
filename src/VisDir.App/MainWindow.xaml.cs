@@ -1318,9 +1318,10 @@ public partial class MainWindow : Window
             UpdateCancelButton.IsEnabled = true;
             UpdateCancelButton.Content = "Later";
             UpdateProgressText.Text = "Download failed.";
+            UpdateService.LogDownloadError(ex);
             MessageBox.Show(
                 this,
-                $"Failed to download update:\n{ex.Message}",
+                $"Failed to download update:\n{ex.Message}\n\n[{ex.GetType().Name} (0x{ex.HResult:X8}) — full trace in %TEMP%\\VisDir\\Updates\\download-error.log]",
                 "Update Download Error",
                 MessageBoxButton.OK,
                 MessageBoxImage.Error);
