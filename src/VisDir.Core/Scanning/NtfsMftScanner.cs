@@ -3,6 +3,7 @@ using System.ComponentModel;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using VisDir.Core.Interop;
+[assembly: System.Runtime.CompilerServices.InternalsVisibleTo("VisDir.Core.Tests")]
 namespace VisDir.Core.Scanning;
 
 /// <summary>Raised when the MFT path is unavailable because the process is not elevated.</summary>
@@ -204,7 +205,7 @@ public sealed class NtfsMftScanner : IDiskScanner
         var extensionRecNos = new List<long>(1024);
         var buffer = GC.AllocateUninitializedArray<byte>(ReadBufferSize);
         bool trace = Environment.GetEnvironmentVariable("VISDIR_TRACE_ERRORS") == "1";
-        long nSlots = 0, nMagic = 0, nFixup = 0, nStruct = 0, nNotInUse = 0;
+        long nSlots = 0, nMagic = 0, nFixup = 0, nStruct = 0, nNotInUse = 0, nDup = 0;
 
         long recordsSeen = 0;
         ulong bytesProcessed = 0;
@@ -267,7 +268,10 @@ public sealed class NtfsMftScanner : IDiskScanner
                             info.LogicalSize = info.DataAllocatedSize = info.AdsAllocatedSize = 0;
                         }
 
-                        entries[info.RecordNumber] = info;
+                        // Offsets are parsed once, so overwrites should be ~zero; count them
+                        // so silent record replacement stays visible in MFTSTAT. Value wins,
+                        // exactly as before — zero behavior change.
+                        if (!entries.TryAdd(info.RecordNumber, info)) { entries[info.RecordNumber] = info; nDup++; }
                         if (info.BaseRecordNumber != 0 && info.BaseRecordNumber != info.RecordNumber)
                         {
                             extensionRecNos.Add(info.RecordNumber);
@@ -367,6 +371,12 @@ public sealed class NtfsMftScanner : IDiskScanner
                                                 remaining -= Math.Min(remaining, gotCur);
                                                 if (gotCur < wantCur)
                                                 {
+                                                    // `want` is always clamped to `validLength - fileOff`, so a
+                                                    // short-of-want read is an anomaly, never a legitimate EOF
+                                                    // (at true EOF got == want and this never triggers). Flag it
+                                                    // so the synchronous resume below re-reads from
+                                                    // `bytesProcessed`; worst case that resume repeats bytes.
+                                                    failed = true;
                                                     if (haveNext)
                                                     {
                                                         uint dummy;
@@ -412,8 +422,14 @@ public sealed class NtfsMftScanner : IDiskScanner
                         {
                             ct.ThrowIfCancellationRequested();
                             uint want = (uint)Math.Min(remaining, (uint)buffer.Length);
+                            // `want` is clamped to `remaining`, so ReadFile-false/got==0 with
+                            // bytes left is an anomaly, never EOF (normal end exits via the
+                            // `remaining > 0` condition). Fail closed: the existing
+                            // MFT→generic fallback then produces a correct tree instead of a
+                            // silently partial one.
                             if (!NtfsNative.ReadFile(hMft, bufPtr, want, out uint got, IntPtr.Zero) || got == 0)
-                                break;
+                                throw new IOException(
+                                    $"Short MFT read at offset {syncBase}: wanted {want}, got {got} (remaining {remaining}).");
                             ParseBuffer(bufPtr, got, syncBase);
                             syncBase += got;
                             ReportProgress(got);
@@ -439,10 +455,13 @@ public sealed class NtfsMftScanner : IDiskScanner
                             uint want = (uint)Math.Min(extentBytes, (uint)buffer.Length);
                             if (!NtfsNative.SetFilePointerEx(hVolume, pos, out _, 0))
                                 throw new Win32Exception(Marshal.GetLastWin32Error());
+                            // `want` is clamped to `extentBytes`, so a failed/zero read with
+                            // bytes left is an anomaly, never end-of-extent (normal end exits
+                            // via `extentBytes > 0`). Fail closed like the Tier-1 resume.
                             if (!NtfsNative.ReadFile(hVolume, bufPtr, want, out uint got, IntPtr.Zero) || got == 0)
                             {
-                                remaining = 0;
-                                break;
+                                throw new IOException(
+                                    $"Short MFT extent read at volume offset {pos}: wanted {want}, got {got} (remaining {remaining}).");
                             }
 
                             ParseBuffer(bufPtr, got, mftBase);
@@ -467,11 +486,28 @@ public sealed class NtfsMftScanner : IDiskScanner
         {
             Console.Error.WriteLine(
                 $"MFTSTAT slots={nSlots} magic={nMagic} fixupFail={nFixup} structFail={nStruct} " +
-                $"notInUse={nNotInUse} kept={entries.Count}");
+                $"notInUse={nNotInUse} dup={nDup} kept={entries.Count}");
         }
 
         MergeExtensionRecords(entries, extensionRecNos);
+        ZeroBadClus(entries);
         return entries;
+    }
+
+    // Rec #8 is NTFS-reserved metadata; its $Bad stream nominally spans the volume
+    // (holes), so billing it double-counts unallocated space. The named branch never
+    // sets Sparse, so flag-gated guards cannot cover it. Post-fold placement defeats
+    // Ads-SUM resurrection from spill segments.
+    internal static void ZeroBadClus(Dictionary<long, MftEntryInfo> entries)
+    {
+        if (entries.TryGetValue(BadClusRecordNumber, out MftEntryInfo bad))
+        {
+            bad.LogicalSize = 0;
+            bad.DataAllocatedSize = 0;
+            bad.AdsAllocatedSize = 0;
+            bad.IndexAllocationSize = 0;
+            entries[BadClusRecordNumber] = bad;
+        }
     }
 
     // Overlapped Tier-1 helpers: Start returns 0=sync-completed, 1=pending, 2=hard failure.

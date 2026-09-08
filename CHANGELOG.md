@@ -3,6 +3,19 @@
 All notable changes to VisDir are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.2.2] - 2026-09-08
+
+### Fixed
+
+- FAST NTFS no longer bills `$BadClus` at volume size (1.9 TB phantom):
+  record #8 is zeroed unconditionally after the extension fold. Its `$Bad`
+  stream is named, so it never sets the sparse flag that gated the old guard,
+  and fold ADS-summing could resurrect bytes past a pre-fold guard.
+- FAST NTFS no longer silently drops the MFT tail: a short pipelined read
+  falls through to the synchronous resume, and unexpected short/failed reads
+  fail closed into the generic fallback instead of presenting a partial tree.
+  Record-key collisions are now counted (`MFTSTAT dup=`).
+
 ## [1.2.1] - 2026-09-08
 
 ### Fixed
