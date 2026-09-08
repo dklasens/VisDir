@@ -2,8 +2,9 @@ using System.IO;
 using System.Diagnostics;
 using System.Globalization;
 using System.Collections.Concurrent;
+using System.Security.Principal;
 using VisDir.Core;
-
+using VisDir.Core.Scanning;
 namespace VisDir.App.Scan;
 
 /// <summary>
@@ -13,6 +14,8 @@ namespace VisDir.App.Scan;
 public sealed class ScanService : IDisposable
 {
     private Process? _process;
+    private CancellationTokenSource? _inProcessCts;
+    private Task? _inProcessTask;
     private string? _tempFile;
     private int _scanSequence;
     private int _activeScanId;
@@ -28,11 +31,18 @@ public sealed class ScanService : IDisposable
     public static bool WorkerAvailable =>
         !string.IsNullOrWhiteSpace(Environment.ProcessPath) && File.Exists(Environment.ProcessPath);
 
-    public bool IsScanning => _process is { HasExited: false };
-
+    public bool IsScanning => _process is { HasExited: false } || _inProcessTask is { IsCompleted: false };
     public void Start(string path, string mode = "auto")
     {
         if (IsScanning) return;
+        // Elevated fast path: scan in-process via IDiskScanner, passing the result
+        // through memory instead of the child + temp snapshot roundtrip. The child
+        // path below stays for non-elevated callers and crash isolation.
+        if (IsElevated() && !string.Equals(mode, "generic", StringComparison.OrdinalIgnoreCase))
+        {
+            StartInProcess(path, mode);
+            return;
+        }
         if (!WorkerAvailable)
         {
             Failed?.Invoke("The VisDir scanner worker is missing from the application directory.");
@@ -131,9 +141,10 @@ public sealed class ScanService : IDisposable
                 bool wasCancelled = _cancelledScans.ContainsKey(scanId);
                 if (!wasCancelled && process.ExitCode == 0 && File.Exists(tempFile))
                 {
-                    using var fs = new FileStream(tempFile, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 16,
+                    using var fs = new FileStream(tempFile, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 18,
                         FileOptions.DeleteOnClose);
-                    ScanResult result = TreeSerializer.Read(fs);
+                    // Worker already finalized totals and sort order; reuse stored aggregates.
+                    ScanResult result = TreeSerializer.Read(fs, recomputeTotals: false);
                     Completed?.Invoke(result);
                 }
                 else if (wasCancelled)
@@ -174,6 +185,110 @@ public sealed class ScanService : IDisposable
         if (scanId != 0) _cancelledScans.TryAdd(scanId, 0);
         try { if (_process is { HasExited: false } p) p.Kill(entireProcessTree: true); }
         catch { /* best effort */ }
+        try { _inProcessCts?.Cancel(); }
+        catch { /* best effort */ }
+    }
+
+    private void StartInProcess(string path, string mode)
+    {
+        _process?.Dispose();
+        _process = null;
+        int scanId = Interlocked.Increment(ref _scanSequence);
+        Volatile.Write(ref _activeScanId, scanId);
+        Interlocked.Exchange(ref _lastProgressReportMs, 0);
+
+        var cts = new CancellationTokenSource();
+        _inProcessCts?.Dispose();
+        _inProcessCts = cts;
+        StatusChanged?.Invoke($"Scanning {path}…");
+
+        var progress = new InlineScanProgress(p =>
+        {
+            long now = Environment.TickCount64;
+            if (now - Interlocked.Read(ref _lastProgressReportMs) < 100) return;
+            Interlocked.Exchange(ref _lastProgressReportMs, now);
+            ProgressChanged?.Invoke(p.Fraction);
+            StatusChanged?.Invoke($"{p.Phase} · {p.FilesSeen:N0} files · {p.DirsSeen:N0} folders");
+        });
+
+        var options = new ScanOptions { Path = path };
+        bool wantMft = !string.Equals(mode, "generic", StringComparison.OrdinalIgnoreCase)
+            && (string.Equals(mode, "mft", StringComparison.OrdinalIgnoreCase) || ShouldUseMft(path));
+        IDiskScanner primary = wantMft ? new NtfsMftScanner() : new GenericScanner();
+        string engine = wantMft ? "mft" : "generic";
+        StatusChanged?.Invoke($"{(wantMft ? "Fast NTFS scan selected" : "Compatible scan selected")} ({engine})");
+
+        CancellationToken token = cts.Token;
+        _inProcessTask = Task.Run(() =>
+        {
+            try
+            {
+                ScanResult result;
+                try
+                {
+                    result = primary.Scan(options, token, progress);
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
+                }
+                catch (Exception) when (wantMft)
+                {
+                    result = new GenericScanner().Scan(options, token, progress);
+                }
+                token.ThrowIfCancellationRequested();
+                if (_cancelledScans.ContainsKey(scanId)) Cancelled?.Invoke();
+                else Completed?.Invoke(result);
+            }
+            catch (OperationCanceledException)
+            {
+                Cancelled?.Invoke();
+            }
+            catch (Exception ex)
+            {
+                if (_cancelledScans.ContainsKey(scanId)) Cancelled?.Invoke();
+                else Failed?.Invoke(ex.Message);
+            }
+            finally
+            {
+                _cancelledScans.TryRemove(scanId, out _);
+                if (Volatile.Read(ref _activeScanId) == scanId)
+                    Volatile.Write(ref _activeScanId, 0);
+            }
+        }, CancellationToken.None);
+    }
+
+    private static bool ShouldUseMft(string path)
+    {
+        try
+        {
+            string root = PathUtils.NormalizeScanRoot(path);
+            if (root.Length != 3 || root[1] != ':' || !root.EndsWith("\\")) return false;
+            if (!Directory.Exists(root)) return false;
+            return string.Equals(VolumeQuery.Query(root).FileSystemName, "NTFS", StringComparison.OrdinalIgnoreCase);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static bool IsElevated()
+    {
+        try
+        {
+            using var identity = WindowsIdentity.GetCurrent();
+            return new WindowsPrincipal(identity).IsInRole(WindowsBuiltInRole.Administrator);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private sealed class InlineScanProgress(Action<ScanProgress> callback) : IProgress<ScanProgress>
+    {
+        public void Report(ScanProgress value) => callback(value);
     }
 
     public void Dispose()
@@ -182,6 +297,7 @@ public sealed class ScanService : IDisposable
         try { if (_tempFile is not null && File.Exists(_tempFile)) File.Delete(_tempFile); }
         catch { /* ignore */ }
         _process?.Dispose();
+        _inProcessCts?.Dispose();
     }
 
     private static Dictionary<string, string> ParseValues(string line)

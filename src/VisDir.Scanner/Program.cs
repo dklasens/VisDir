@@ -105,8 +105,14 @@ public static class ScannerCli
             cts.Cancel();
         };
 
+        // Worker emits PROGRESS over stderr; the parent coalesces at 10Hz and DONE always flushes.
+        // Throttle here to >=500ms between emits so large scans don't flood the pipe; line format unchanged.
+        long lastProgressMs = Environment.TickCount64 - 500;
         var progress = new InlineProgress<ScanProgress>(p =>
         {
+            long now = Environment.TickCount64;
+            if (now - Volatile.Read(ref lastProgressMs) < 500) return;
+            Volatile.Write(ref lastProgressMs, now);
             Console.Error.WriteLine(
                 $"PROGRESS files={p.FilesSeen} dirs={p.DirsSeen} bytes={p.BytesSeen} ms={p.ElapsedMs:F0} " +
                 $"fraction={p.Fraction:F6} phase={Uri.EscapeDataString(p.Phase)}");
@@ -118,7 +124,23 @@ public static class ScannerCli
         ScannerSelection selection = SelectScanner(mode, path);
         Console.Error.WriteLine($"ENGINE selected={selection.Name} reason={Uri.EscapeDataString(selection.Reason)}");
         IDiskScanner primary = selection.Scanner;
-        ScanResult result = primary.Scan(options, cts.Token, progress);
+        ScanResult result;
+        try
+        {
+            result = primary.Scan(options, cts.Token, progress);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex) when (selection.Name == "mft")
+        {
+            // MFT fast path failed (e.g. access lost mid-scan): fall back to the
+            // compatible scanner so elevated callers still get a result. Both
+            // failures propagate to Execute for exit code 3.
+            Console.Error.WriteLine($"ENGINE selected=generic reason={Uri.EscapeDataString($"fallback-after-mft-failure:{ex.Message}")}");
+            result = new GenericScanner().Scan(options, cts.Token, progress);
+        }
         sw.Stop();
 
         Console.Error.WriteLine(
@@ -149,7 +171,7 @@ public static class ScannerCli
             string temp = full + $".partial-{Guid.NewGuid():N}";
             try
             {
-                using (var fs = new FileStream(temp, FileMode.CreateNew, FileAccess.Write, FileShare.None, 1 << 16))
+                using (var fs = new FileStream(temp, FileMode.CreateNew, FileAccess.Write, FileShare.None, 1 << 18))
                     TreeSerializer.Write(fs, result);
                 File.Move(temp, full, overwrite: true);
             }
@@ -330,6 +352,9 @@ public static class ScannerCli
     }
 
     /// <summary>Compares two scans of the same volume; returns exit code 0 when within tolerance.</summary>
+    /// <remarks>Engine contract (documented, not equalized): MFT counts INDEX_ALLOCATION
+    /// plus ADS bytes while generic counts unnamed $DATA only, so small systematic
+    /// differences are expected and the 1% tolerance absorbs them.</remarks>
     private static int DiffCheck(ScanResult mft, ScanResult generic)
     {
         Console.WriteLine();
@@ -356,14 +381,14 @@ public static class ScannerCli
                 ? Math.Abs((double)m - g.TotalAllocated) / g.TotalAllocated * 100
                 : 0;
             if (pct > worst && m < g.TotalAllocated) { worst = pct; worstName = g.Name; }
-            if (pct > 5 && m < g.TotalAllocated)
+            if (pct > 1 && m < g.TotalAllocated)
                 Console.WriteLine($"  MISMATCH {g.Name}: mft={SizeFormatter.Format(m)} generic={SizeFormatter.Format(g.TotalAllocated)} ({pct:0.0}%)");
             else if (pct > 25)
                 Console.WriteLine($"  EXTRA-VISIBILITY {g.Name}: mft sees {SizeFormatter.Format(m - g.TotalAllocated)} more (shadow copies/system metadata)");
         }
 
-        Console.WriteLine(worst <= 5
-            ? "DIFF PASS: all top-level items within 5% tolerance."
+        Console.WriteLine(worst <= 1
+            ? "DIFF PASS: all top-level items within 1% tolerance."
             : $"DIFF WORST: {worstName} at {worst:0.0}%");
 
         // Leaf-level evidence: top 15 files from each engine, matched by name.
@@ -398,7 +423,7 @@ public static class ScannerCli
         }
         if (shown == 0) Console.WriteLine("  (top files match)");
 
-        return worst <= 5 ? 0 : 4;
+        return worst <= 1 ? 0 : 4;
     }
 
     private static List<(string Path, ulong Alloc)> TopLeafFiles(ScanResult r, int n)

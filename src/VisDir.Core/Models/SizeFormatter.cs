@@ -10,8 +10,12 @@ public static class SizeFormatter
         const ulong KB = 1024;
         const ulong MB = KB * 1024;
         const ulong GB = MB * 1024;
+        const ulong TB = GB * 1024;
+        const ulong PB = TB * 1024;
         return bytes switch
         {
+            >= PB => $"{Trim(bytes / (double)PB, decimals)} PB",
+            >= TB => $"{Trim(bytes / (double)TB, decimals)} TB",
             >= GB => $"{Trim(bytes / (double)GB, decimals)} GB",
             >= MB => $"{Trim(bytes / (double)MB, decimals)} MB",
             >= KB => $"{Trim(bytes / (double)KB, decimals)} KB",
@@ -24,8 +28,12 @@ public static class SizeFormatter
         const ulong KB = 1024;
         const ulong MB = KB * 1024;
         const ulong GB = MB * 1024;
+        const ulong TB = GB * 1024;
+        const ulong PB = TB * 1024;
         return bytes switch
         {
+            >= PB => $"{bytes / (double)PB:0.#} PB",
+            >= TB => $"{bytes / (double)TB:0.#} TB",
             >= GB => $"{bytes / (double)GB:0.#} GB",
             >= MB => $"{bytes / (double)MB:0} MB",
             >= KB => $"{bytes / (double)KB:0} KB",

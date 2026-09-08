@@ -30,7 +30,7 @@ New-Item -ItemType Directory -Path $publishDir -Force | Out-Null
 $appProject = Join-Path $repoRoot 'src\VisDir.App\VisDir.App.csproj'
 $publishArguments = @(
     'publish', $appProject, '-c', $Configuration, '-r', $Runtime, '--self-contained', 'true',
-    '-p:PublishReadyToRun=true', '-p:PublishSingleFile=false', '-p:DebugType=embedded',
+    '-p:PublishReadyToRun=true', '-p:TieredPGO=true', '-p:PublishSingleFile=false', '-p:DebugType=embedded',
     "-p:Version=$Version",
     '-o', $publishDir
 )

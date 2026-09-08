@@ -1,3 +1,4 @@
+using System.Buffers.Binary;
 using System.IO;
 
 namespace VisDir.Core;
@@ -21,7 +22,11 @@ public static class TreeSerializer
 
     public static void Write(Stream stream, ScanResult result)
     {
-        using var bw = new BinaryWriter(stream, System.Text.Encoding.UTF8, leaveOpen: true);
+        // BufferedStream coalesces the many small field writes into large sequential transfers.
+        // It is intentionally never disposed: the caller's stream must stay open, so all exits
+        // below flush explicitly instead. 256 KiB per snapshot-buffer contract.
+        var buffered = new BufferedStream(stream, 1 << 18);
+        using var bw = new BinaryWriter(buffered, System.Text.Encoding.UTF8, leaveOpen: true);
 
         bw.Write(Magic);
         bw.Write(SnapshotVersion);
@@ -61,19 +66,25 @@ public static class TreeSerializer
         // Pre-order with explicit stack (children pushed reversed to preserve sorted order).
         var stack = new Stack<FsNode>();
         stack.Push(result.Root);
+        // One packed header per node: single stream write instead of eight tiny ones.
+        Span<byte> header = stackalloc byte[48];
         while (stack.Count > 0)
         {
             FsNode n = stack.Pop();
             count++;
 
-            bw.Write((ushort)n.Flags);
-            bw.Write((ushort)0);
-            bw.Write(n.FileKey);
-            bw.Write(n.LogicalSize);
-            bw.Write(n.AllocatedSize);
-            bw.Write(n.TotalLogical);
-            bw.Write(n.TotalAllocated);
-            bw.Write((uint)(n.Children?.Count ?? 0));
+            // Fixed-size header, little-endian exactly as the former BinaryWriter sequence:
+            // u16 flags, u16 reserved, i64 key, u64x4 sizes, u32 childCount. The transient
+            // ChildrenSorted bit is masked out so snapshot bytes stay v2-identical.
+            BinaryPrimitives.WriteUInt16LittleEndian(header[..2], (ushort)(n.Flags & ~NodeFlags.ChildrenSorted));
+            BinaryPrimitives.WriteUInt16LittleEndian(header[2..4], 0);
+            BinaryPrimitives.WriteInt64LittleEndian(header[4..12], n.FileKey);
+            BinaryPrimitives.WriteUInt64LittleEndian(header[12..20], n.LogicalSize);
+            BinaryPrimitives.WriteUInt64LittleEndian(header[20..28], n.AllocatedSize);
+            BinaryPrimitives.WriteUInt64LittleEndian(header[28..36], n.TotalLogical);
+            BinaryPrimitives.WriteUInt64LittleEndian(header[36..44], n.TotalAllocated);
+            BinaryPrimitives.WriteUInt32LittleEndian(header[44..48], (uint)(n.Children?.Count ?? 0));
+            bw.BaseStream.Write(header);
             WriteString(bw, n.Name);
 
             if (n.Children is { } kids)
@@ -90,9 +101,11 @@ public static class TreeSerializer
         }
         else if (count != upfrontCount)
         {
+            buffered.Flush();
             throw new InvalidDataException("Tree was modified while the snapshot was being written.");
         }
         bw.Flush();
+        buffered.Flush();
     }
 
     private static ulong CountNodes(FsNode root)
@@ -141,11 +154,13 @@ public static class TreeSerializer
         }
     }
 
-    public static ScanResult Read(Stream stream)
+    public static ScanResult Read(Stream stream) => Read(stream, recomputeTotals: true);
+
+    public static ScanResult Read(Stream stream, bool recomputeTotals)
     {
         try
         {
-            return ReadCore(stream);
+            return ReadCore(stream, recomputeTotals);
         }
         catch (EndOfStreamException ex)
         {
@@ -153,7 +168,7 @@ public static class TreeSerializer
         }
     }
 
-    private static ScanResult ReadCore(Stream stream)
+    private static ScanResult ReadCore(Stream stream, bool recomputeTotals)
     {
         using var br = new BinaryReader(stream, System.Text.Encoding.UTF8, leaveOpen: true);
 
@@ -224,7 +239,8 @@ public static class TreeSerializer
             var node = new FsNode
             {
                 Name = name,
-                Flags = (NodeFlags)flagsRaw,
+                // The ChildrenSorted bit is a transient in-memory hint and is never trusted from disk.
+                Flags = (NodeFlags)(flagsRaw & ~(ushort)NodeFlags.ChildrenSorted),
                 FileKey = key,
                 LogicalSize = logical,
                 AllocatedSize = allocated,
@@ -248,7 +264,20 @@ public static class TreeSerializer
                 if (parent.RemainingChildren > 0) parentStack.Push(parent);
             }
 
-            if (childCount > 0) parentStack.Push((node, childCount));
+            if (childCount > 0)
+            {
+                // Snapshot bomb guard: childCount is bounded by nodes left minus what
+                // ancestors already owe, so a huge count can't preallocate memory.
+                ulong remaining = nodeCount - i - 1;
+                ulong stackOwed = 0;
+                foreach ((FsNode _, uint owed) in parentStack) stackOwed += owed;
+                if (stackOwed > remaining || childCount > remaining - stackOwed)
+                    throw new InvalidDataException($"Node {i:N0} has more children than nodes left.");
+                // Declared up front: presize once so the child batch appends without regrowth.
+                // Capped to remaining (int-safe: childCount already <= int.MaxValue above).
+                node.EnsureCapacity((int)Math.Min((ulong)childCount, remaining));
+                parentStack.Push((node, childCount));
+            }
         }
 
         if (root is null) throw new InvalidDataException("Snapshot contains no nodes.");
@@ -257,7 +286,9 @@ public static class TreeSerializer
 
         // Stored Total* values are not trusted: recompute them from self sizes (overwrite on
         // drift) so corrupt totals can never surface, and re-establish TotalAllocated ordering.
-        TreeOps.Finalize(root);
+        // Skipped when the caller trusts the stored aggregates; topology above is validated either way.
+        if (recomputeTotals)
+            TreeOps.Finalize(root);
 
         return new ScanResult
         {

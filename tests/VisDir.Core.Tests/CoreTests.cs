@@ -490,3 +490,413 @@ public class UpdateServiceTests
         writer.Write(content);
     }
 }
+
+public class NtfsRecordParserTests
+{
+    private const ushort UsaOffset = 0x30;
+    private const ushort UsaSequence = 0xA55A;
+
+    // Minimal synthetic FILE record: header + appended attrs + end marker, closed by a
+    // valid update sequence (sector tails stashed into the USA, as on disk). USA offset
+    // is 0x30: NtfsRecordParser rejects anything below 0x30 with FailFixup.
+    private sealed class RecordBuilder
+    {
+        public byte[] Buf;
+        public int Cursor;
+        public ushort UsaCount;
+
+        public RecordBuilder(int size, ushort usaCount, ushort flags = 0x0001, uint recNo = 7, ulong baseRef = 0)
+        {
+            Buf = new byte[size];
+            UsaCount = usaCount;
+            "FILE"u8.CopyTo(Buf);
+            BitConverter.GetBytes(UsaOffset).CopyTo(Buf, 4);
+            BitConverter.GetBytes(usaCount).CopyTo(Buf, 6);
+            int attrsOff = (UsaOffset + usaCount * 2 + 7) & ~7;
+            BitConverter.GetBytes((ushort)attrsOff).CopyTo(Buf, 0x14);
+            BitConverter.GetBytes(flags).CopyTo(Buf, 0x16);
+            BitConverter.GetBytes(baseRef).CopyTo(Buf, 0x20);
+            BitConverter.GetBytes(recNo).CopyTo(Buf, 0x2C);
+            Cursor = attrsOff;
+        }
+
+        public void Append(byte[] attr)
+        {
+            attr.CopyTo(Buf, Cursor);
+            Cursor += attr.Length;
+        }
+
+        public byte[] Finish()
+        {
+            BitConverter.GetBytes(0xFFFFFFFFu).CopyTo(Buf, Cursor);
+            Cursor += 8;
+            BitConverter.GetBytes((uint)Cursor).CopyTo(Buf, 0x18);
+            int sectors = UsaCount - 1;
+            int stride = Buf.Length / sectors;
+            for (int s = 1; s <= sectors; s++)
+            {
+                int slot = s * stride - 2;
+                Buf[UsaOffset + s * 2] = Buf[slot];
+                Buf[UsaOffset + s * 2 + 1] = Buf[slot + 1];
+                Buf[slot] = (byte)(UsaSequence & 0xFF);
+                Buf[slot + 1] = (byte)(UsaSequence >> 8);
+            }
+            BitConverter.GetBytes(UsaSequence).CopyTo(Buf, UsaOffset);
+            return Buf;
+        }
+    }
+
+    private static byte[] ResidentAttr(uint type, byte[] value, string? name = null)
+    {
+        int nameLen = name?.Length ?? 0;
+        int valueOffset = 0x18 + nameLen * 2;
+        int attrLen = (valueOffset + value.Length + 7) & ~7;
+        var attr = new byte[attrLen];
+        BitConverter.GetBytes(type).CopyTo(attr, 0);
+        BitConverter.GetBytes((uint)attrLen).CopyTo(attr, 4);
+        attr[8] = 0; // resident
+        attr[9] = (byte)nameLen;
+        BitConverter.GetBytes((ushort)0x18).CopyTo(attr, 0x0A);
+        BitConverter.GetBytes((uint)value.Length).CopyTo(attr, 0x10);
+        BitConverter.GetBytes((ushort)valueOffset).CopyTo(attr, 0x14);
+        if (name is not null)
+            for (int i = 0; i < name.Length; i++)
+                BitConverter.GetBytes(name[i]).CopyTo(attr, 0x18 + i * 2);
+        value.CopyTo(attr, valueOffset);
+        return attr;
+    }
+
+    private static byte[] NonResidentDataAttr(ushort attrFlags, ulong alloc, ulong real, ulong compressed, ulong lowestVcn = 0, string? name = null)
+    {
+        int nameLen = name?.Length ?? 0;
+        const int headerLen = 0x48;
+        int nameOffset = headerLen;
+        int runsOffset = headerLen + nameLen * 2;
+        int attrLen = (runsOffset + 1 + 7) & ~7; // +1 zero run terminator
+        var attr = new byte[attrLen];
+        BitConverter.GetBytes(0x80u).CopyTo(attr, 0);
+        BitConverter.GetBytes((uint)attrLen).CopyTo(attr, 4);
+        attr[8] = 1; // non-resident
+        attr[9] = (byte)nameLen;
+        BitConverter.GetBytes((ushort)nameOffset).CopyTo(attr, 0x0A);
+        BitConverter.GetBytes(attrFlags).CopyTo(attr, 0x0C);
+        BitConverter.GetBytes(lowestVcn).CopyTo(attr, 0x10);
+        BitConverter.GetBytes(lowestVcn).CopyTo(attr, 0x18); // highestVcn (unused by parser)
+        BitConverter.GetBytes((ushort)runsOffset).CopyTo(attr, 0x20);
+        BitConverter.GetBytes(alloc).CopyTo(attr, 0x28);
+        BitConverter.GetBytes(real).CopyTo(attr, 0x30);
+        BitConverter.GetBytes(real).CopyTo(attr, 0x38); // initialized size (unused by parser)
+        BitConverter.GetBytes(compressed).CopyTo(attr, 0x40);
+        if (name is not null)
+            for (int i = 0; i < name.Length; i++)
+                BitConverter.GetBytes(name[i]).CopyTo(attr, nameOffset + i * 2);
+        attr[runsOffset] = 0;
+        return attr;
+    }
+
+    private static byte[] FileNameValue(ulong parent, string name, byte ns, uint fileFlags = 0)
+    {
+        var value = new byte[0x42 + name.Length * 2];
+        BitConverter.GetBytes(parent).CopyTo(value, 0);
+        BitConverter.GetBytes(fileFlags).CopyTo(value, 0x38);
+        value[0x40] = (byte)name.Length;
+        value[0x41] = ns;
+        for (int i = 0; i < name.Length; i++)
+            BitConverter.GetBytes(name[i]).CopyTo(value, 0x42 + i * 2);
+        return value;
+    }
+
+    private static byte[] FileNameAttr(ulong parent, string name, byte ns, uint fileFlags = 0) =>
+        ResidentAttr(0x30, FileNameValue(parent, name, ns, fileFlags));
+
+    private static byte[] SiAttr(uint fileFlags = 0)
+    {
+        var value = new byte[0x24];
+        BitConverter.GetBytes(fileFlags).CopyTo(value, 0x20);
+        return ResidentAttr(0x10, value);
+    }
+
+    private static byte[] ReparseAttr(uint tag)
+    {
+        var value = new byte[8];
+        BitConverter.GetBytes(tag).CopyTo(value, 0);
+        return ResidentAttr(0xC0, value);
+    }
+
+    private static byte[] ResidentDataAttr(uint valueLen, string? name = null) =>
+        ResidentAttr(0x80, new byte[valueLen], name);
+
+    private static byte[] IndexAllocAttr(ulong lowestVcn, ulong allocSize)
+    {
+        const int runsOffset = 0x40;
+        const int attrLen = 0x48;
+        var attr = new byte[attrLen];
+        BitConverter.GetBytes(0xA0u).CopyTo(attr, 0);
+        BitConverter.GetBytes((uint)attrLen).CopyTo(attr, 4);
+        attr[8] = 1; // non-resident
+        BitConverter.GetBytes(lowestVcn).CopyTo(attr, 0x10);
+        BitConverter.GetBytes((ushort)runsOffset).CopyTo(attr, 0x20);
+        BitConverter.GetBytes(allocSize).CopyTo(attr, 0x28);
+        attr[runsOffset] = 0;
+        return attr;
+    }
+
+    // valueOffset 0x30 + valueLength 0xFFFFFFF8 wraps to 0x28 in u32 math.
+    private static byte[] OverflowAttr(uint type)
+    {
+        var attr = new byte[0x40];
+        BitConverter.GetBytes(type).CopyTo(attr, 0);
+        BitConverter.GetBytes((uint)0x40).CopyTo(attr, 4);
+        attr[8] = 0; // resident
+        BitConverter.GetBytes(0xFFFFFFF8u).CopyTo(attr, 0x10); // valueLength
+        BitConverter.GetBytes((ushort)0x30).CopyTo(attr, 0x14); // valueOffset
+        return attr;
+    }
+
+    private static byte[] TruncatedTailAttr()
+    {
+        var attr = new byte[0x10];
+        BitConverter.GetBytes(0x80u).CopyTo(attr, 0);
+        BitConverter.GetBytes((uint)0x400).CopyTo(attr, 4); // claims far beyond usedSize
+        attr[8] = 1;
+        return attr;
+    }
+
+    [Fact]
+    public unsafe void SparseData_ReadsCompressedSizeAt0x40()
+    {
+        const ulong allocUncompressed = 200UL * 1024 * 1024 * 1024; // +0x28 decoy
+        const ulong real = 12345; // +0x30
+        const ulong compressed = 2UL * 1024 * 1024 * 1024; // +0x40
+        var b = new RecordBuilder(1024, usaCount: 3);
+        b.Append(NonResidentDataAttr(attrFlags: 0x8000, alloc: allocUncompressed, real: real, compressed: compressed));
+        byte[] rec = b.Finish();
+        fixed (byte* p = rec)
+        {
+            Assert.True(NtfsRecordParser.TryParseRecord(p, rec.Length, out MftEntryInfo info));
+            Assert.Equal(compressed, info.DataAllocatedSize);
+            Assert.Equal(real, info.LogicalSize);
+            Assert.True(info.HasPrimaryData);
+            Assert.True(info.Sparse);
+        }
+    }
+
+    [Fact]
+    public unsafe void CompressedData_ReadsCompressedSizeAt0x40()
+    {
+        const ulong allocUncompressed = 200UL * 1024 * 1024 * 1024;
+        const ulong real = 99999;
+        const ulong compressed = 2UL * 1024 * 1024 * 1024;
+        var b = new RecordBuilder(1024, usaCount: 3);
+        b.Append(NonResidentDataAttr(attrFlags: 0x0001, alloc: allocUncompressed, real: real, compressed: compressed));
+        byte[] rec = b.Finish();
+        fixed (byte* p = rec)
+        {
+            Assert.True(NtfsRecordParser.TryParseRecord(p, rec.Length, out MftEntryInfo info));
+            Assert.Equal(compressed, info.DataAllocatedSize);
+            Assert.Equal(real, info.LogicalSize);
+            Assert.True(info.Compressed);
+        }
+    }
+
+    [Fact]
+    public unsafe void AdsSparse_Reads0x40()
+    {
+        const ulong allocUncompressed = 200UL * 1024 * 1024 * 1024;
+        const ulong real = 777;
+        const ulong compressed = 2UL * 1024 * 1024 * 1024;
+        var b = new RecordBuilder(1024, usaCount: 3);
+        b.Append(NonResidentDataAttr(attrFlags: 0x8000, alloc: allocUncompressed, real: real, compressed: compressed, name: "ads"));
+        byte[] rec = b.Finish();
+        fixed (byte* p = rec)
+        {
+            Assert.True(NtfsRecordParser.TryParseRecord(p, rec.Length, out MftEntryInfo info));
+            Assert.Equal(compressed, info.AdsAllocatedSize);
+            Assert.Equal(0UL, info.DataAllocatedSize);
+        }
+    }
+
+    [Fact]
+    public unsafe void BoundsOverflow_FileNameGuarded()
+    {
+        var b = new RecordBuilder(1024, usaCount: 3);
+        b.Append(OverflowAttr(0x30));
+        byte[] rec = b.Finish();
+        fixed (byte* p = rec)
+        {
+            Assert.True(NtfsRecordParser.TryParseRecord(p, rec.Length, out MftEntryInfo info));
+            Assert.False(info.HasFileName);
+        }
+    }
+
+    [Fact]
+    public unsafe void BoundsOverflow_SI_Guarded()
+    {
+        var b = new RecordBuilder(1024, usaCount: 3);
+        b.Append(OverflowAttr(0x10));
+        byte[] rec = b.Finish();
+        fixed (byte* p = rec)
+        {
+            Assert.True(NtfsRecordParser.TryParseRecord(p, rec.Length, out MftEntryInfo info));
+            Assert.False(info.Offline);
+        }
+    }
+
+    [Fact]
+    public unsafe void Fixup_4KnStride()
+    {
+        var b1 = new RecordBuilder(1024, usaCount: 3); // 2 x 512B sectors
+        b1.Append(FileNameAttr(parent: 5, name: "a", ns: 1));
+        byte[] r1 = b1.Finish();
+        var b2 = new RecordBuilder(4096, usaCount: 2); // 1 x 4096B sector (4Kn)
+        b2.Append(FileNameAttr(parent: 5, name: "b", ns: 1));
+        byte[] r2 = b2.Finish();
+        fixed (byte* p1 = r1)
+        {
+            Assert.True(NtfsRecordParser.TryParseRecord(p1, r1.Length, out MftEntryInfo info1));
+            Assert.Equal("a", info1.Name);
+        }
+        fixed (byte* p2 = r2)
+        {
+            // A 512-hardcoded stride would check phantom tails at 510/1022/... and fail fixup.
+            Assert.True(NtfsRecordParser.TryParseRecord(p2, r2.Length, out MftEntryInfo info2));
+            Assert.Equal("b", info2.Name);
+        }
+    }
+
+    [Fact]
+    public unsafe void HardlinkParent_Atomic()
+    {
+        var b = new RecordBuilder(1024, usaCount: 3);
+        b.Append(FileNameAttr(parent: 10, name: "alpha", ns: 1));
+        b.Append(FileNameAttr(parent: 20, name: "beta", ns: 1));
+        byte[] rec = b.Finish();
+        fixed (byte* p = rec)
+        {
+            Assert.True(NtfsRecordParser.TryParseRecord(p, rec.Length, out MftEntryInfo info));
+            Assert.Equal("alpha", info.Name);
+            Assert.Equal(10UL, info.ParentRecordNumber);
+            Assert.Equal(2, info.FileNameLinks);
+        }
+    }
+
+    [Fact]
+    public unsafe void DosName_NotCountedAsHardlink()
+    {
+        var b = new RecordBuilder(1024, usaCount: 3);
+        b.Append(FileNameAttr(parent: 5, name: "longname", ns: 1));
+        b.Append(FileNameAttr(parent: 5, name: "LONGNA~1", ns: 2));
+        byte[] rec = b.Finish();
+        fixed (byte* p = rec)
+        {
+            Assert.True(NtfsRecordParser.TryParseRecord(p, rec.Length, out MftEntryInfo info));
+            Assert.Equal(1, info.FileNameLinks);
+            Assert.Equal("longname", info.Name);
+        }
+    }
+
+    [Fact]
+    public unsafe void Win32VsDos_Ranking()
+    {
+        var b = new RecordBuilder(1024, usaCount: 3);
+        b.Append(FileNameAttr(parent: 5, name: "SHORT~1", ns: 2));
+        b.Append(FileNameAttr(parent: 5, name: "LongName", ns: 1));
+        byte[] rec = b.Finish();
+        fixed (byte* p = rec)
+        {
+            Assert.True(NtfsRecordParser.TryParseRecord(p, rec.Length, out MftEntryInfo info));
+            Assert.Equal("LongName", info.Name);
+            Assert.Equal(1, info.FileNameLinks);
+        }
+    }
+
+    [Fact]
+    public unsafe void ReparseTag_Parsed()
+    {
+        var b = new RecordBuilder(1024, usaCount: 3);
+        b.Append(FileNameAttr(parent: 5, name: "link", ns: 1));
+        b.Append(ReparseAttr(0xA000000C));
+        byte[] rec = b.Finish();
+        fixed (byte* p = rec)
+        {
+            Assert.True(NtfsRecordParser.TryParseRecord(p, rec.Length, out MftEntryInfo info));
+            Assert.Equal(0xA000000Cu, info.ReparseTag);
+        }
+    }
+
+    [Fact]
+    public unsafe void TornTail_NoName_Fails()
+    {
+        var b = new RecordBuilder(1024, usaCount: 3);
+        b.Append(TruncatedTailAttr());
+        byte[] rec = b.Finish();
+        fixed (byte* p = rec)
+        {
+            Assert.False(NtfsRecordParser.TryParseRecord(p, rec.Length, out _, out byte stage));
+            Assert.Equal(NtfsRecordParser.FailStructure, stage);
+        }
+    }
+
+    [Fact]
+    public unsafe void TornTail_WithName_KeepsName()
+    {
+        var b = new RecordBuilder(1024, usaCount: 3);
+        b.Append(FileNameAttr(parent: 5, name: "kept", ns: 1));
+        b.Append(TruncatedTailAttr());
+        byte[] rec = b.Finish();
+        fixed (byte* p = rec)
+        {
+            Assert.True(NtfsRecordParser.TryParseRecord(p, rec.Length, out MftEntryInfo info));
+            Assert.Equal("kept", info.Name);
+            Assert.True(info.HasFileName);
+        }
+    }
+
+    [Fact]
+    public unsafe void ResidentData_ExcludedFromAlloc()
+    {
+        var b = new RecordBuilder(1024, usaCount: 3);
+        b.Append(ResidentDataAttr(100));
+        b.Append(ResidentDataAttr(50, name: "ads"));
+        byte[] rec = b.Finish();
+        fixed (byte* p = rec)
+        {
+            Assert.True(NtfsRecordParser.TryParseRecord(p, rec.Length, out MftEntryInfo info));
+            Assert.True(info.HasPrimaryData);
+            Assert.True(info.PrimaryDataResident);
+            Assert.Equal(100UL, info.LogicalSize);
+            Assert.Equal(0UL, info.DataAllocatedSize);
+            Assert.Equal(0UL, info.AdsAllocatedSize);
+        }
+    }
+
+    [Fact]
+    public unsafe void IndexAllocation_FirstExtentOnly()
+    {
+        var b = new RecordBuilder(1024, usaCount: 3);
+        b.Append(IndexAllocAttr(lowestVcn: 0, allocSize: 8192));
+        b.Append(IndexAllocAttr(lowestVcn: 5, allocSize: 8192));
+        byte[] rec = b.Finish();
+        fixed (byte* p = rec)
+        {
+            Assert.True(NtfsRecordParser.TryParseRecord(p, rec.Length, out MftEntryInfo info));
+            Assert.Equal(8192UL, info.IndexAllocationSize);
+        }
+    }
+
+    [Fact]
+    public unsafe void ContinuationRecord_MarksHasPrimaryWithoutSizes()
+    {
+        var b = new RecordBuilder(1024, usaCount: 3);
+        b.Append(NonResidentDataAttr(attrFlags: 0x0001, alloc: 0x1234_5000, real: 0x1234_5000, compressed: 0x1234_5000, lowestVcn: 42));
+        byte[] rec = b.Finish();
+        fixed (byte* p = rec)
+        {
+            Assert.True(NtfsRecordParser.TryParseRecord(p, rec.Length, out MftEntryInfo info));
+            Assert.True(info.HasPrimaryData);
+            Assert.Equal(0UL, info.LogicalSize);
+            Assert.Equal(0UL, info.DataAllocatedSize);
+            Assert.True(info.Compressed);
+        }
+    }
+}

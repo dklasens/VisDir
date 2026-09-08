@@ -18,8 +18,9 @@ public static unsafe class NativeMethods
     public const int ERROR_NOT_SUPPORTED = 50;
     public const int ERROR_INVALID_PARAMETER = 87;
     public const int ERROR_MORE_DATA = 234;
-
-    // FILE_ID_EXTD_DIR_INFO fixed-field offsets (see FILE_ID_EXTD_DIR_INFO docs).
+    // Placeholder compatibility: PHCM_DISGUISE_PLACEHOLDER makes cloud files report
+    // resident attributes so no tag-family special-casing is needed.
+    public const int PHCM_DISGUISE_PLACEHOLDER = 2;
     public const int Extd_NextEntryOffset = 0;
     public const int Extd_EndOfFile = 40;
     public const int Extd_AllocationSize = 48;
@@ -86,4 +87,10 @@ public static unsafe class NativeMethods
         out uint lpBytesPerSector,
         out uint lpNumberOfFreeClusters,
         out uint lpTotalNumberOfClusters);
+
+    [DllImport("ntdll.dll")]
+    public static extern uint RtlSetProcessPlaceholderCompatibilityMode(int mode);
+
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    public static extern bool GetVolumePathNameW(string lpszFileName, char* lpszVolumePathName, uint cchBufferLength);
 }

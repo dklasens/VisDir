@@ -26,6 +26,35 @@ public sealed class FsNode
         if (child.Parent is not null) throw new InvalidOperationException("Child already has a parent; re-parenting is not allowed.");
         child.Parent = this;
         (Children ??= new List<FsNode>()).Add(child);
+        Flags &= ~NodeFlags.ChildrenSorted;
+    }
+
+    /// <summary>Presizes the child list so a known batch appends without regrowth.</summary>
+    public void EnsureCapacity(int capacity)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(capacity);
+        if (Children is null)
+        {
+            if (capacity > 0) Children = new List<FsNode>(capacity);
+        }
+        else Children.EnsureCapacity(capacity);
+    }
+
+    /// <summary>Appends a batch with a single presize; same per-child guards as <see cref="AddChild"/>.</summary>
+    public void AddChildren(IEnumerable<FsNode> children)
+    {
+        ArgumentNullException.ThrowIfNull(children);
+        if (children is ICollection<FsNode> batch)
+            EnsureCapacity((Children?.Count ?? 0) + batch.Count);
+        foreach (FsNode child in children)
+        {
+            ArgumentNullException.ThrowIfNull(child);
+            if (ReferenceEquals(child, this)) throw new ArgumentException("A node cannot be its own child.", nameof(child));
+            if (child.Parent is not null) throw new InvalidOperationException("Child already has a parent; re-parenting is not allowed.");
+            child.Parent = this;
+            (Children ??= new List<FsNode>()).Add(child);
+        }
+        Flags &= ~NodeFlags.ChildrenSorted;
     }
 
     public string GetPath()

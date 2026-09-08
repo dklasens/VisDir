@@ -18,9 +18,9 @@ Built with **C# (.NET 10)**, **WPF**, and **SkiaSharp** for high-performance har
   - Right-click any sector on the sunburst or item in the contents list to instantly **Reveal in File Explorer** or **Copy Full Path**.
 - **Live Filtering & Breadcrumbs**: Search and filter large directories in real time with proportional capacity gauges.
 - **Accurate Space Accounting**:
-  - Accounts for physical cluster rounding, resident `$DATA`, and Alternate Data Streams (ADS).
-  - Reparse point and directory junction loop protection.
-  - Cloud-filter awareness (zeroes non-resident OneDrive placeholders to reflect true physical disk occupancy).
+  - Accounts for physical cluster rounding, resident `$DATA` exclusion, sparse/compressed on-disk sizes, and Alternate Data Streams (ADS).
+  - Reparse-tag-gated junction/symlink protection — cloud placeholders (OneDrive/Dropbox) scan as ordinary folders, with non-resident file content counting zero on-disk bytes.
+  - Deterministic hardlink attribution (same folder sizes on every rescan); MFT failures fall back to the Compatible engine instead of failing the scan.
 - **Privacy & Performance**: Zero telemetry and analytics. VisDir only connects to GitHub to check for updates, and otherwise processes scan data locally.
 
 ---

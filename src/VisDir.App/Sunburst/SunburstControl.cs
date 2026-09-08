@@ -69,7 +69,11 @@ public class SunburstControl : SkiaSharp.Views.WPF.SKElement
     private double _animDepthFrom;
     private readonly Stopwatch _animClock = new();
 
-    private sealed record CachedArc(SunburstNode Node, SKPath Path, float StrokeWidth);
+    /// <summary>Cached stroke geometry plus resolved paints. <see cref="Palette"/> HSL math runs
+    /// once at cache build; paints only read these fields (hover/dim repaints stay allocation-free).</summary>
+    private sealed record CachedArc(
+        SunburstNode Node, SKPath Path, float StrokeWidth,
+        SKColor Fill, SKColor FillDimmed, SKColor HoverFill, float RMid);
     private sealed record CachedCapacityArc(SKPath Path, SKColor Color, float StrokeWidth);
     private sealed record LegendItem(SKColor Color, string Text);
 
@@ -375,6 +379,9 @@ public class SunburstControl : SkiaSharp.Views.WPF.SKElement
             // Keep arrow-key navigation continuing from the hovered wedge.
             if (node is { Depth: > 0, IsAggregatedWedge: false }) SyncKeyboardIndex(node);
             HoveredChanged?.Invoke(source);
+            // SKElement exposes only full-surface InvalidateVisual (no dirty-rect repaint), so the
+            // whole tree repaints here — but arc colors come straight from the render cache with
+            // zero per-arc HSL math, keeping hover/selection flips at a single cheap paint.
             InvalidateVisual();
         }
     }
@@ -466,9 +473,17 @@ public class SunburstControl : SkiaSharp.Views.WPF.SKElement
         float scale = (float)(width / Math.Max(ActualWidth, 1)); // DPI scaling
         var g = GeometryFor(width, height);
 
+        if (_animating && _visibleNodes.Count > SnapThreshold)
+        {
+            // Snap guard for layouts that grew past the threshold mid-flight: path + paint
+            // cost dominates at this size, animation would stutter.
+            _animating = false;
+            _animBloom = false;
+            CompositionTarget.Rendering -= OnAnimationTick;
+        }
         if (_animating)
         {
-            DrawAnimated(canvas, g, AnimationProgress(true, _animClock));
+            DrawAnimated(canvas, width, height, g, AnimationProgress(true, _animClock));
         }
         else
         {
@@ -509,13 +524,14 @@ public class SunburstControl : SkiaSharp.Views.WPF.SKElement
         ClearRenderCache();
         _cacheWidth = width;
         _cacheHeight = height;
-
         foreach (SunburstNode node in _visibleNodes)
         {
             float rMid = g.inner + node.Depth * g.band + g.ringW / 2;
             var rect = new SKRect(g.cx - rMid, g.cy - rMid, g.cx + rMid, g.cy + rMid);
             var path = CreateArcPath(rect, Degrees(node.Angle0), Degrees(node.Sweep));
-            var arc = new CachedArc(node, path, g.ringW);
+            SKColor fill = Palette.ColorFor(node, false);
+            var arc = new CachedArc(node, path, g.ringW, fill, fill.WithAlpha(DimmedAlpha),
+                Palette.ColorFor(node, true), rMid);
             _cachedArcs.Add(arc);
             _arcBySource[node.Source] = arc;
         }
@@ -571,8 +587,9 @@ public class SunburstControl : SkiaSharp.Views.WPF.SKElement
         foreach (CachedArc arc in _cachedArcs)
         {
             if (_capacityArcs.Count > 0 && arc.Node.Depth == 0) continue;
-            SKColor color = Palette.ColorFor(arc.Node, ReferenceEquals(arc.Node, _hovered));
-            if (ShouldDim(arc.Node, dimActive, focusBranch)) color = color.WithAlpha(DimmedAlpha);
+            SKColor color = ReferenceEquals(arc.Node, _hovered)
+                ? arc.HoverFill
+                : ShouldDim(arc.Node, dimActive, focusBranch) ? arc.FillDimmed : arc.Fill;
             _strokePaint.StrokeWidth = arc.StrokeWidth;
             _strokePaint.Color = color;
             canvas.DrawPath(arc.Path, _strokePaint);
@@ -583,13 +600,13 @@ public class SunburstControl : SkiaSharp.Views.WPF.SKElement
             FindCachedArc(selected) is { } selArc)
         {
             _strokePaint.StrokeWidth = selArc.StrokeWidth + 2;
-            _strokePaint.Color = Palette.ColorFor(selArc.Node, true);
+            _strokePaint.Color = selArc.HoverFill;
             canvas.DrawPath(selArc.Path, _strokePaint);
         }
         if (FindCachedArc(_hovered is { Depth: > 0 } ? _hovered.Source : null) is { } hoveredArc)
         {
             _strokePaint.StrokeWidth = hoveredArc.StrokeWidth + 3;
-            _strokePaint.Color = Palette.ColorFor(hoveredArc.Node, true);
+            _strokePaint.Color = hoveredArc.HoverFill;
             canvas.DrawPath(hoveredArc.Path, _strokePaint);
         }
     }
@@ -604,38 +621,60 @@ public class SunburstControl : SkiaSharp.Views.WPF.SKElement
     private CachedArc? FindCachedArc(FsNode? source) =>
         source is not null && _arcBySource.TryGetValue(source, out CachedArc? arc) ? arc : null;
 
-    private void DrawAnimated(SKCanvas canvas, (float cx, float cy, float radius, float inner, float band, float ringW) g, double t)
+    /// <summary>Drill/bloom transition drawn from the steady-state cache through one canvas-level
+    /// transform. The per-tick path rebuild/dispose storm is gone; t == 1 is the identity, so the
+    /// settled frame matches <see cref="DrawTree"/> exactly. Rotation reuses
+    /// <see cref="_animAngleFrom"/> and the zoom reuses <see cref="_animScaleFrom"/> under the same
+    /// easing, clamped so drill-up starts no larger than 20x.</summary>
+    private void DrawAnimated(SKCanvas canvas, int width, int height, (float cx, float cy, float radius, float inner, float band, float ringW) g, double t)
     {
-        _strokePaint.StrokeWidth = g.ringW;
+        // The steady-state cache is the animation source; the early-out makes this free after the first tick.
+        EnsureRenderCache(width, height, g);
         float bloomScale = _animBloom ? (float)Lerp(0.88, 1.0, t) : 1f;
         byte bloomAlpha = _animBloom ? (byte)(255 * t) : (byte)255;
         double angleOffset = _animBloom ? 0 : Lerp(_animAngleFrom, 0, t);
         double angleScale = _animBloom ? 1 : Lerp(_animScaleFrom, 1, t);
-        double depthOffset = _animBloom ? 0 : Lerp(_animDepthFrom, 0, t);
+        float scale = _animBloom ? bloomScale : Math.Clamp((float)angleScale, 0.05f, 20f);
+        float rotation = _animBloom ? 0f : Degrees(angleOffset);
 
-        foreach (SunburstNode node in _visibleNodes)
+        canvas.Save();
+        canvas.Translate(g.cx, g.cy);
+        if (rotation != 0f) canvas.RotateDegrees(rotation);
+        if (scale != 1f) canvas.Scale(scale);
+        canvas.Translate(-g.cx, -g.cy);
+
+        float diag = MathF.Sqrt(g.cx * g.cx + g.cy * g.cy);
+        foreach (CachedArc arc in _cachedArcs)
         {
-            double sweep = node.Sweep * angleScale;
-            if (sweep < 0.003) continue;
-            double depth = node.Depth + depthOffset;
-            if (depth > MaxVisibleDepth) continue;
-            float rMid = (float)(g.inner + depth * g.band + g.ringW / 2) * bloomScale;
-            if (rMid <= g.ringW / 2) continue; // fully inside the center hole
-
-            var rect = new SKRect(g.cx - rMid, g.cy - rMid, g.cx + rMid, g.cy + rMid);
-            using var path = CreateArcPath(rect, Degrees(angleOffset + node.Angle0 * angleScale), Degrees(sweep));
-            SKColor color = Palette.ColorFor(node, false);
-            _strokePaint.Color = bloomAlpha == 255 ? color : color.WithAlpha(bloomAlpha);
-            canvas.DrawPath(path, _strokePaint);
+            // Sub-pixel wedges rasterize to nothing; rings scaled past the viewport corner are invisible.
+            // (Capacity arcs stay hidden mid-transition, as before.)
+            if ((float)arc.Node.Sweep * arc.RMid * scale < 0.5f) continue;
+            if (arc.RMid * scale - arc.StrokeWidth / 2 > diag) continue;
+            SKColor color = arc.Fill;
+            if (bloomAlpha != 255) color = color.WithAlpha(bloomAlpha);
+            _strokePaint.StrokeWidth = arc.StrokeWidth;
+            _strokePaint.Color = color;
+            canvas.DrawPath(arc.Path, _strokePaint);
         }
+        canvas.Restore();
     }
 
     private static string? TruncateToFit(SKFont font, SKPaint paint, string text, float maxW)
     {
         const string ellipsis = "…";
-        int length = text.Length;
-        while (length > 0 && font.MeasureText(text[..length] + ellipsis, paint) > maxW) length--;
-        return length >= 5 ? text[..length] + ellipsis : null;
+        float ellipsisWidth = font.MeasureText(ellipsis, paint);
+        if (ellipsisWidth > maxW) return null;
+        float budget = maxW - ellipsisWidth;
+        // Binary search the longest fitting prefix: one measure per probe instead of per char,
+        // and a single concatenation for the result.
+        int lo = 0, hi = text.Length;
+        while (lo < hi)
+        {
+            int mid = (lo + hi + 1) / 2;
+            if (font.MeasureText(text[..mid], paint) <= budget) lo = mid;
+            else hi = mid - 1;
+        }
+        return lo >= 5 ? text[..lo] + ellipsis : null;
     }
 
     private void DrawLegend(SKCanvas canvas, float height, float scale)

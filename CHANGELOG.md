@@ -3,6 +3,39 @@
 All notable changes to VisDir are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.2.0] - 2026-09-08
+
+### Fixed
+
+- MFT engine no longer drops cloud-placeholder subtrees (OneDrive/Dropbox):
+  descent is gated on the reparse tag (mount point/symlink only), and the tag
+  is plumbed through `MftEntryInfo.ReparseTag`.
+- Sparse and compressed files report on-disk bytes (offset `0x40`) instead of
+  the hole-inclusive VCN range; `$BadClus` zeroing kept as a sparse-only guard.
+- Closed an unsigned-overflow out-of-bounds read in the resident bounds checks;
+  fixup derives the sector stride from the record instead of assuming 512 B.
+- Hardlinked files take name and parent from the same `$FILE_NAME`; DOS 8.3
+  names no longer inflate the link count; extension records fold name/parent.
+- Generic engine attributes hardlinks deterministically (lexicographically
+  first path keeps the bytes); placeholder handling no longer depends on
+  per-process disguise luck; extd-class downgrade is scoped per volume.
+- MFT failure falls back to the generic engine instead of exiting with code 3.
+- Snapshot reader clamps `childCount` against nodes remaining (no giant
+  preallocation from a crafted file). `SizeFormatter` gains TB/PB.
+
+### Performance
+
+- Elevated scans run in-process (no child + snapshot round trip); worker
+  snapshots load with `recomputeTotals: false`; deleted MFT slots skip parsing.
+- Generic per-worker buffers drop from 1 MiB to 64 KiB; `$MFT` handle uses
+  `SEQUENTIAL_SCAN`.
+- Navigation layouts run off the UI thread with stale-sequence abandon;
+  search reconciles in bulk under a 1000-item cap.
+- Benchmark measures the dictionary sink with deleted/extension records and
+  per-phase timing; `--diff` tolerance tightened 5% to 1% with the engine
+  accuracy contract documented (MFT counts index + ADS, generic unnamed
+  `$DATA` only).
+
 ## [1.1.1] - 2026-09-07
 
 Incremental release: lighter scans, cleaner chart, harder updater.

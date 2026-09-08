@@ -16,4 +16,6 @@ public enum NodeFlags : ushort
     ErrorNode = 1 << 9,
     NamedStreamExtra = 1 << 10,
     Hardlinked = 1 << 11,
+    /// <summary>Transient in-memory hint: children are in <see cref="TreeOps.Finalize"/> order. Never persisted; cleared on mutation.</summary>
+    ChildrenSorted = 1 << 12,
 }

@@ -3,6 +3,7 @@ using System.ComponentModel;
 using System.Diagnostics;
 using System.Globalization;
 using System.IO;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Security.Principal;
 using System.Windows;
@@ -35,18 +36,61 @@ public sealed class DriveChoice
     public override string ToString() => DisplayName;
 }
 
-public sealed class FileItemView(FsNode node, Brush chip, Brush textBrush, Brush sizeBrush, double barFraction, string toolTipText, bool isAggregated = false)
+public sealed class FileItemView : INotifyPropertyChanged
 {
-    public FsNode Node { get; } = node;
+    public FsNode Node { get; }
     public string Name => Node.Name;
-    public string SizeText => SizeFormatter.Format(Node.TotalAllocated);
     public string Kind => Node.IsDirectory ? "Folder" : "File";
-    public Brush ChipBrush { get; } = chip;
-    public Brush TextBrush { get; } = textBrush;
-    public Brush SizeBrush { get; } = sizeBrush;
-    public double BarFraction { get; } = barFraction;
-    public string ToolTipText { get; } = toolTipText;
-    public bool IsAggregated { get; } = isAggregated;
+
+    private ulong _bytes;
+    private string _sizeText;
+    /// <summary>Formatted size, computed once per node and refreshed only when the byte count changes.</summary>
+    public string SizeText { get => _sizeText; private set => SetField(ref _sizeText, value); }
+    private Brush _chipBrush;
+    public Brush ChipBrush { get => _chipBrush; private set => SetField(ref _chipBrush, value); }
+    private Brush _textBrush;
+    public Brush TextBrush { get => _textBrush; private set => SetField(ref _textBrush, value); }
+    private Brush _sizeBrush;
+    public Brush SizeBrush { get => _sizeBrush; private set => SetField(ref _sizeBrush, value); }
+    private string _toolTipText;
+    public string ToolTipText { get => _toolTipText; private set => SetField(ref _toolTipText, value); }
+    public bool IsAggregated { get; }
+
+    public event PropertyChangedEventHandler? PropertyChanged;
+
+    public FileItemView(FsNode node, Brush chip, Brush textBrush, Brush sizeBrush, string toolTipText, bool isAggregated = false)
+    {
+        Node = node;
+        _bytes = node.TotalAllocated;
+        _sizeText = SizeFormatter.Format(_bytes);
+        _chipBrush = chip;
+        _textBrush = textBrush;
+        _sizeBrush = sizeBrush;
+        _toolTipText = toolTipText;
+        IsAggregated = isAggregated;
+    }
+
+    /// <summary>Refresh cached display values after a diff-reuse; raises change only for altered properties.</summary>
+    public void Refresh(Brush chip, Brush textBrush, Brush sizeBrush, string toolTipText)
+    {
+        ChipBrush = chip;
+        TextBrush = textBrush;
+        SizeBrush = sizeBrush;
+        ToolTipText = toolTipText;
+        if (Node.TotalAllocated != _bytes)
+        {
+            _bytes = Node.TotalAllocated;
+            SizeText = SizeFormatter.Format(_bytes);
+        }
+    }
+
+    private void SetField<T>(ref T field, T value, [CallerMemberName] string? name = null)
+    {
+        if (EqualityComparer<T>.Default.Equals(field, value)) return;
+        field = value;
+        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
+    }
+
     public override string ToString() => $"{Name}, {SizeText}, {Kind}";
 }
 
@@ -67,11 +111,22 @@ public partial class MainWindow : Window
     private bool _suppressFilterRebuild;
     private readonly DispatcherTimer _filterDebounce;
     private Dictionary<FsNode, FileItemView> _fileItemByNode = new(ReferenceEqualityComparer.Instance);
+    /// <summary>Bound to <see cref="ChildrenList"/> once; rebuilds diff into it so virtualization
+    /// containers (Recycling) survive filter keystrokes instead of regenerating from scratch.</summary>
+    private readonly ObservableCollection<FileItemView> _fileItems = new();
+    private FileItemView? _aggregatedItem;
+    // Wedge-rank + chip-brush cache, valid for one folder view (identical across filter keystrokes).
+    private FsNode? _rankRoot;
+    private int _rankChildCount = -1;
+    private ulong _rankTotal;
+    private Dictionary<FsNode, int> _rankOf = new(ReferenceEqualityComparer.Instance);
+    private Brush[] _branchBrushes = [];
     private long _lastProgressUiMs; // 10Hz gate for scan progress (Environment.TickCount64)
 
     public MainWindow()
     {
         InitializeComponent();
+        ChildrenList.ItemsSource = _fileItems;
         ApplySystemContrast();
         SystemParameters.StaticPropertyChanged += OnSystemParametersChanged;
         SourceInitialized += (_, _) => EnableDarkTitleBar();
@@ -293,7 +348,8 @@ public partial class MainWindow : Window
         _forwardHistory.Clear();
         Burst.ViewRoot = null;
         Burst.Volume = null;
-        ChildrenList.ItemsSource = null;
+        _fileItems.Clear();
+        _aggregatedItem = null;
         _fileItemByNode.Clear();
         LandingPanel.Visibility = Visibility.Visible;
         ContentShell.Visibility = Visibility.Collapsed;
@@ -393,7 +449,8 @@ public partial class MainWindow : Window
         _forwardHistory.Clear();
         UpdateHistoryButtons();
 
-        ChildrenList.ItemsSource = null;
+        _fileItems.Clear();
+        _aggregatedItem = null;
         CurrentFolderName.Text = Path.GetFileName(path) is { Length: > 0 } fn ? fn : path;
         CurrentFolderTotalSize.Text = "Scanning…";
         UpdateSelectedNodeInfo(null);
@@ -462,15 +519,18 @@ public partial class MainWindow : Window
         UpdateHistoryButtons();
 
         // First layout builds off-UI-thread (FsNode/SunburstNode are free-threaded);
-        // the overlay stays indeterminate until NavigateInto returns.
+        // the overlay stays indeterminate until NavigateInto returns. Bumping the
+        // sequence abandons any in-flight navigation layout from the previous scan.
         ScanProgressBar.IsIndeterminate = true;
+        Interlocked.Increment(ref _layoutSequence);
         Burst.PendingLayout = await Task.Run(() => SunburstLayout.Build(result.Root, maxDepth: SunburstControl.MaxVisibleDepth));
         Burst.Volume = result.Volume;
         NavigateInto(result.Root, recordHistory: false);
         ScanOverlay.Visibility = Visibility.Collapsed;
     }
 
-    private void NavigateInto(FsNode node, bool recordHistory = true)
+    private int _layoutSequence;
+    private async void NavigateInto(FsNode node, bool recordHistory = true)
     {
         if (!node.IsDirectory) return;
 
@@ -487,7 +547,6 @@ public partial class MainWindow : Window
         ClearSearchFilter();
         _viewRoot = node;
         _selectedNode = node;
-        Burst.ViewRoot = node;
 
         CurrentFolderName.Text = node.Name.TrimEnd('\\');
         if (CurrentFolderName.Text.Length == 0) CurrentFolderName.Text = node.Name;
@@ -497,6 +556,20 @@ public partial class MainWindow : Window
         RebuildFileList();
         UpdateSelectedNodeInfo(node);
         UpdateHistoryButtons();
+
+        // Heavy layout builds off-UI-thread; stale navigations are abandoned by sequence.
+        // Reuses the PendingLayout fast path when the scan completion already prebuilt it.
+        if (Burst.PendingLayout is { } pre && ReferenceEquals(pre.Source, node))
+        {
+            Burst.ViewRoot = node;
+            return;
+        }
+        int seq = Interlocked.Increment(ref _layoutSequence);
+        SunburstNode layout = await Task.Run(() => SunburstLayout.Build(node, maxDepth: SunburstControl.MaxVisibleDepth));
+        if (seq != Volatile.Read(ref _layoutSequence)) return;
+        if (!ReferenceEquals(_viewRoot, node)) return;
+        Burst.PendingLayout = layout;
+        Burst.ViewRoot = node;
     }
 
     private void NavigateUp()
@@ -583,39 +656,54 @@ public partial class MainWindow : Window
         IEnumerable<FsNode> children = allChildren;
         if (query.Length > 0) children = children.Where(n => n.Name.Contains(query, StringComparison.OrdinalIgnoreCase));
         List<FsNode> nodes = children.ToList();
-
-        // Calculate branch ranks to match wedge colors exactly
-        var rankOf = new Dictionary<FsNode, int>(ReferenceEqualityComparer.Instance);
-        int branchCount = 0;
-        const double minSweep = 0.006;
+        // Cap search materialization so a huge match set can't build unbounded rows.
+        const int MaxSearchItems = 1000;
+        if (query.Length > 0 && nodes.Count > MaxSearchItems) nodes.RemoveRange(MaxSearchItems, nodes.Count - MaxSearchItems);
         ulong viewTotal = _viewRoot.TotalAllocated;
-        for (int i = 0; i < allChildren.Count; i++)
+
+        // Wedge ranks + chip brushes are identical for every keystroke within one folder view;
+        // recompute only when the viewed folder, its child count, or its total changes.
+        if (!ReferenceEquals(_rankRoot, _viewRoot) || _rankChildCount != allChildren.Count || _rankTotal != viewTotal)
         {
-            FsNode child = allChildren[i];
-            bool isVisibleWedge = viewTotal == 0 || i == 0 ||
-                SunburstLayout.FullCircle * child.TotalAllocated / viewTotal >= minSweep;
-            if (isVisibleWedge) rankOf[child] = branchCount++;
+            var rankOf = new Dictionary<FsNode, int>(allChildren.Count, ReferenceEqualityComparer.Instance);
+            int branchCount = 0;
+            const double minSweep = 0.006;
+            for (int i = 0; i < allChildren.Count; i++)
+            {
+                FsNode child = allChildren[i];
+                bool isVisibleWedge = viewTotal == 0 || i == 0 ||
+                    SunburstLayout.FullCircle * child.TotalAllocated / viewTotal >= minSweep;
+                if (isVisibleWedge) rankOf[child] = branchCount++;
+            }
+
+            // One frozen brush per visible branch; rows share instances instead of allocating per row.
+            int brushCount = Math.Max(branchCount, 1);
+            var branchBrushes = new Brush[brushCount];
+            for (int i = 0; i < brushCount; i++) branchBrushes[i] = Palette.BrushForBranch(i, brushCount, 1);
+
+            _rankRoot = _viewRoot;
+            _rankChildCount = allChildren.Count;
+            _rankTotal = viewTotal;
+            _rankOf = rankOf;
+            _branchBrushes = branchBrushes;
         }
 
-        // One frozen brush per visible branch; rows share instances instead of allocating per row.
-        int brushCount = Math.Max(branchCount, 1);
-        var branchBrushes = new Brush[brushCount];
-        for (int i = 0; i < brushCount; i++) branchBrushes[i] = Palette.BrushForBranch(i, brushCount, 1);
-
         // Set active folder dot color
-        CurrentFolderDot.Background = branchBrushes[0];
-
-        ulong largest = nodes.Count > 0 ? nodes.Max(n => n.TotalAllocated) : 0;
-        var items = new List<FileItemView>(nodes.Count);
-        ulong aggregatedBytes = 0;
-        int aggregatedCount = 0;
+        CurrentFolderDot.Background = _branchBrushes[0];
 
         var normalTextBrush = TryFindResource("TextBrush") as Brush ?? Brushes.White;
         var dimTextBrush = TryFindResource("DimBrush") as Brush ?? new SolidColorBrush(Color.FromRgb(0x8E, 0x95, 0xAA));
 
+        FsNode? previouslySelected = (ChildrenList.SelectedItem as FileItemView)?.Node;
+
+        // Build the desired order, reusing live row instances (with their cached SizeText/ToolTipText)
+        // so surviving rows keep their virtualized containers and selection.
+        var wanted = new List<FileItemView>(nodes.Count + 1);
+        ulong aggregatedBytes = 0;
+        int aggregatedCount = 0;
         foreach (FsNode node in nodes)
         {
-            bool isVisible = rankOf.ContainsKey(node);
+            bool isVisible = _rankOf.ContainsKey(node);
             if (!isVisible && query.Length == 0)
             {
                 aggregatedBytes += node.TotalAllocated;
@@ -625,44 +713,71 @@ public partial class MainWindow : Window
 
             double fraction = viewTotal > 0 ? (double)node.TotalAllocated / viewTotal : 0;
             string tip = $"{node.Name}\n{SizeFormatter.Format(node.TotalAllocated)} on disk · {(node.IsDirectory ? "Folder" : "File")} · {fraction:P1} of this folder";
-
-            items.Add(new FileItemView(
-                node,
-                ChipBrushFor(node, rankOf, branchBrushes),
-                normalTextBrush,
-                normalTextBrush,
-                largest > 0 ? (double)node.TotalAllocated / largest : 0,
-                tip));
+            Brush chip = ChipBrushFor(node, _rankOf, _branchBrushes);
+            if (!_fileItemByNode.TryGetValue(node, out FileItemView? item))
+            {
+                item = new FileItemView(node, chip, normalTextBrush, normalTextBrush, tip);
+                _fileItemByNode[node] = item;
+            }
+            else
+            {
+                item.Refresh(chip, normalTextBrush, normalTextBrush, tip);
+            }
+            wanted.Add(item);
         }
 
-        // DaisyDisk aggregated row: "smaller objects..."
+        // DaisyDisk aggregated row: "smaller objects..." — one synthetic node reused across rebuilds.
         if (aggregatedCount > 0 && query.Length == 0)
         {
-            var aggNode = new FsNode
-            {
-                Name = "smaller objects...",
-                TotalAllocated = aggregatedBytes,
-                Flags = NodeFlags.Directory,
-            };
             string aggTip = $"{aggregatedCount} smaller items totaling {SizeFormatter.Format(aggregatedBytes)}";
-            items.Add(new FileItemView(
-                aggNode,
-                Palette.AggregatedBrush,
-                dimTextBrush,
-                dimTextBrush,
-                largest > 0 ? (double)aggregatedBytes / largest : 0,
-                aggTip,
-                isAggregated: true));
+            FileItemView agg;
+            if (_aggregatedItem is { } kept)
+            {
+                kept.Node.TotalAllocated = aggregatedBytes;
+                kept.Refresh(Palette.AggregatedBrush, dimTextBrush, dimTextBrush, aggTip);
+                agg = kept;
+            }
+            else
+            {
+                var aggNode = new FsNode
+                {
+                    Name = "smaller objects...",
+                    TotalAllocated = aggregatedBytes,
+                    Flags = NodeFlags.Directory,
+                };
+                agg = new FileItemView(aggNode, Palette.AggregatedBrush, dimTextBrush, dimTextBrush, aggTip, isAggregated: true);
+                _aggregatedItem = agg;
+            }
+            wanted.Add(agg);
+        }
+        else
+        {
+            _aggregatedItem = null;
         }
 
-        FsNode? previouslySelected = (ChildrenList.SelectedItem as FileItemView)?.Node;
-        var byNode = new Dictionary<FsNode, FileItemView>(items.Count, ReferenceEqualityComparer.Instance);
-        foreach (FileItemView item in items) byNode[item.Node] = item;
+        // Bulk reconcile without O(n^2) IndexOf+Move: fast-path when already ordered,
+        // otherwise clear+add. The 150ms debounce coalesces typing.
+        bool inOrder = _fileItems.Count == wanted.Count;
+        if (inOrder)
+        {
+            for (int i = 0; i < wanted.Count; i++)
+                if (!ReferenceEquals(_fileItems[i], wanted[i])) { inOrder = false; break; }
+        }
+        if (!inOrder)
+        {
+            _fileItems.Clear();
+            foreach (FileItemView item in wanted) _fileItems.Add(item);
+        }
+
+        // Drop lookup entries for nodes that left the view so the map cannot pin detached rows.
+        var byNode = new Dictionary<FsNode, FileItemView>(wanted.Count, ReferenceEqualityComparer.Instance);
+        foreach (FileItemView item in wanted)
+            if (!item.IsAggregated) byNode[item.Node] = item;
         _fileItemByNode = byNode;
-        ChildrenList.ItemsSource = items;
+
         if (previouslySelected is not null && byNode.TryGetValue(previouslySelected, out FileItemView? restore))
             ChildrenList.SelectedItem = restore;
-        if (items.Count == 0)
+        if (_fileItems.Count == 0)
         {
             EmptyListText.Text = query.Length == 0 ? "This folder is empty" : $"No matches for \"{query}\"";
             EmptyListText.Visibility = Visibility.Visible;

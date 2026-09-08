@@ -13,6 +13,10 @@
     <OutputType>WinExe</OutputType>
     <TargetFramework>net10.0-windows10.0.19041.0</TargetFramework>
     <UseWPF>true</UseWPF>
+    <!-- Dynamic PGO: runtime-guided re-JIT on top of R2R images (publish supplies R2R).
+         Kept here (not Directory.Build.props) so VisDir.Core stays plain net10.0 AOT-eligible.
+         Composite R2R stays off: it is incompatible with WPF. -->
+    <TieredPGO>true</TieredPGO>
     <ApplicationIcon>Assets\visdir-icon.ico</ApplicationIcon>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <RuntimeIdentifiers>win-x64;win-arm64</RuntimeIdentifiers>

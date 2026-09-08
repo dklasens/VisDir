@@ -52,13 +52,15 @@ public static class VolumeQuery
             finally { NativeMethods.CloseHandle(hDir); }
         }
 
-        // Drive-letter roots: get cluster geometry + capacity. UNC paths keep defaults.
-        if (root.Length >= 2 && root[1] == ':')
+        // Resolve the hosting volume via GetVolumePathNameW so mount points bill to
+        // the mounted volume (not the host drive) and UNC keeps defaults on failure.
+        // UNC paths have no serial/geometry: serial 0 + 4 KiB cluster, never throw.
+        string volumeRoot = GetVolumeRoot(root);
+        if (!volumeRoot.StartsWith(@"\\"))
         {
-            string driveRoot = $"{root[0]}:\\";
-            if (NativeMethods.GetDiskFreeSpaceW(driveRoot, out uint spc, out uint bps, out _, out _))
+            if (NativeMethods.GetDiskFreeSpaceW(volumeRoot, out uint spc, out uint bps, out _, out _))
                 cluster = spc * bps;
-            if (NativeMethods.GetDiskFreeSpaceExW(driveRoot, out _, out ulong t, out ulong f))
+            if (NativeMethods.GetDiskFreeSpaceExW(volumeRoot, out _, out ulong t, out ulong f))
             {
                 total = t;
                 free = f;
@@ -87,6 +89,32 @@ public static class VolumeQuery
         for (int i = 0; i < max; i++)
             if (p[i] == '\0') return i;
         return max;
+    }
+
+    private static unsafe string GetVolumeRoot(string root)
+    {
+        // Prefer the mount-point-aware volume path; fall back to the drive root
+        // (or the path itself for UNC) so callers never throw.
+        try
+        {
+            Span<char> buf = stackalloc char[261];
+            fixed (char* p = buf)
+            {
+                if (NativeMethods.GetVolumePathNameW(root, p, 260))
+                {
+                    int len = IndexOfTerminator(p, 260);
+                    if (len > 0) return new string(p, 0, len);
+                }
+            }
+        }
+        catch { /* ignore: use fallback below */ }
+        try
+        {
+            string? pathRoot = Path.GetPathRoot(root);
+            if (!string.IsNullOrEmpty(pathRoot)) return pathRoot;
+        }
+        catch { /* ignore */ }
+        return root;
     }
 }
 

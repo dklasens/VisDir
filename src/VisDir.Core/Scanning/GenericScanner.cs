@@ -34,7 +34,7 @@ public sealed class SafetyLimitException : Exception
 /// </summary>
 public sealed class GenericScanner : IDiskScanner
 {
-    private const int InitialBufferSize = 1 << 20;   // 1 MiB
+    private const int InitialBufferSize = 64 * 1024; // 64 KiB (avoids LOH; grows to MaxBufferSize on demand)
     private const int MaxBufferSize = 4 << 20;       // cap per-worker scratch at 4 MiB
     private const int MaxDepth = 512;
     private const long DefaultMaxDirs = 20_000_000;
@@ -55,9 +55,20 @@ public sealed class GenericScanner : IDiskScanner
 
     private int _active;                 // outstanding directories (seeded with 1)
     private volatile bool _cancelled;
-    private bool _useExtdClass = true;   // sticky downgrade if volume rejects extd class
+    // Per-volume extd-class enablement keyed by VolumeSerialNumber (0 = unknown).
+    // One volume rejecting the class must not disable hardlink FileIds elsewhere.
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<uint, bool> _extdByVolume = new();
     private readonly ThreadLocal<byte[]?> _buffer = new(() => null);
     private readonly ThreadLocal<LocalTally> _local = new(() => new LocalTally(), trackAllValues: true);
+    // Placeholder compatibility is per-process: pin once per worker thread, ignore failure.
+    private readonly ThreadLocal<bool> _placeholderModeSet = new(() => false, trackAllValues: true);
+    // Per-worker scratch: StringBuilder for JoinDir (avoids per-child intermediate strings)
+    // and a small stack of List<FsNode>(128) so per-directory allocations reuse capacity.
+    // Stack (not single slot) because HandleItem can re-enter inline when the queue is full.
+    private readonly ThreadLocal<System.Text.StringBuilder> _pathBuilder =
+        new(() => new System.Text.StringBuilder(260), trackAllValues: true);
+    private readonly ThreadLocal<Stack<List<FsNode>>> _listPool =
+        new(() => new Stack<List<FsNode>>(4), trackAllValues: true);
 
     // Hardlink dedup: same FileId reached via multiple directories counts allocated
     // bytes once. FileId is only available from the extended info class (key==0 otherwise).
@@ -67,6 +78,13 @@ public sealed class GenericScanner : IDiskScanner
         Enumerable.Range(0, DedupShards)
             .Select(_ => new System.Collections.Concurrent.ConcurrentDictionary<long, byte>())
             .ToArray();
+    // FileKeys seen more than once (batch-time, FileKey only). The deterministic
+    // post-join pass resolves these by (FileKey, LogicalSize) + lexicographic path.
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<long, byte> _hardlinkDupKeys = new();
+    // Reparse tag per directory node (reference key; reparse dirs are rare).
+    // Lets Process skip only name-surrogate links (family 0xA0) while keeping the
+    // ReparsePoint flag on all reparse points. Tag 0 = unknown (non-extd): skip.
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<FsNode, uint> _dirReparseTags = new();
 
     private sealed class LocalTally
     {
@@ -102,7 +120,8 @@ public sealed class GenericScanner : IDiskScanner
 
         _active = 1;
         _dirsSeen = 1; // root
-        channel.Writer.TryWrite(new Item(volume.RootPath, root, 0));
+        uint volSerial = (uint)volume.VolumeSerialNumber;
+        channel.Writer.TryWrite(new Item(volume.RootPath, root, 0, volSerial));
 
         var workers = new Task[threads];
         for (int i = 0; i < threads; i++)
@@ -152,6 +171,11 @@ public sealed class GenericScanner : IDiskScanner
         _filesSeen = files;
         _dirsSeen = dirs;
         _bytesSeen = bytes;
+        // Deterministic hardlink attribution: keep bytes on the lexicographically-first
+        // path per (FileKey, LogicalSize); zero losers so the root total stays stable
+        // regardless of worker arrival order. Must run before Finalize aggregates.
+        if (!_hardlinkDupKeys.IsEmpty)
+            _bytesSeen -= DeterminizeHardlinks(root);
         if (_braked)
             throw new SafetyLimitException(
                 $"Scan aborted: directory count exceeded safety limit ({MaxDirsSafetyLimit:N0}). " +
@@ -184,7 +208,7 @@ public sealed class GenericScanner : IDiskScanner
         return new ScanResult { Volume = volume, Root = root, Stats = stats, EngineName = "generic" };
     }
 
-    private readonly record struct Item(string Path, FsNode Node, int Depth);
+    private readonly record struct Item(string Path, FsNode Node, int Depth, uint VolumeSerial);
 
     private void ResetState()
     {
@@ -196,8 +220,10 @@ public sealed class GenericScanner : IDiskScanner
         _braked = false;
         _cancelled = false;
         _snapshotTaken = 0;
-        _useExtdClass = true;
+        _extdByVolume.Clear();
         foreach (var shard in _seenFileIds) shard.Clear();
+        _hardlinkDupKeys.Clear();
+        _dirReparseTags.Clear();
         foreach (LocalTally t in _local.Values) t.Files = t.Dirs = t.Bytes = 0;
         _errorCounts.Clear();
         while (_errorSamples.TryDequeue(out _)) { }
@@ -205,6 +231,14 @@ public sealed class GenericScanner : IDiskScanner
 
     private async Task WorkerLoop(ChannelReader<Item> reader, ChannelWriter<Item> writer, CancellationToken ct)
     {
+        // Pin placeholder compatibility once per worker thread so cloud files report
+        // resident attributes regardless of the host process default. Best-effort.
+        if (!_placeholderModeSet.Value)
+        {
+            try { NativeMethods.RtlSetProcessPlaceholderCompatibilityMode(NativeMethods.PHCM_DISGUISE_PLACEHOLDER); }
+            catch { /* ignore: degraded placeholder view only */ }
+            _placeholderModeSet.Value = true;
+        }
         try
         {
             while (!_cancelled)
@@ -228,7 +262,7 @@ public sealed class GenericScanner : IDiskScanner
         }
         finally
         {
-            // Return this worker's scratch to 1 MiB at scan end so idle threads
+            // Return this worker's scratch to 64 KiB at scan end so idle threads
             // don't pin a 4 MiB buffer until the next scan (or forever).
             if (_buffer.Value is { Length: > InitialBufferSize })
                 _buffer.Value = new byte[InitialBufferSize];
@@ -239,7 +273,7 @@ public sealed class GenericScanner : IDiskScanner
     {
         try
         {
-            await Process(item.Path, item.Node, item.Depth, writer, ct).ConfigureAwait(false);
+            await Process(item.Path, item.Node, item.Depth, item.VolumeSerial, writer, ct).ConfigureAwait(false);
         }
         catch (OperationCanceledException)
         {
@@ -288,32 +322,51 @@ public sealed class GenericScanner : IDiskScanner
         }
     }
 
-    private async Task Process(string dirPath, FsNode dirNode, int depth, ChannelWriter<Item> writer, CancellationToken ct)
+    private async Task Process(string dirPath, FsNode dirNode, int depth, uint volSerial, ChannelWriter<Item> writer, CancellationToken ct)
     {
-        List<FsNode> children = Enumerate(dirPath, ct);
-
-        foreach (FsNode child in children)
+        List<FsNode> children = Enumerate(dirPath, volSerial, ct);
+        int childCount;
+        try
         {
-            dirNode.AddChild(child);
+            // Single presize + attach (AddChildren presizes once, preserves AddChild invariants).
+            dirNode.AddChildren(children);
+            childCount = children.Count;
 
-            if ((child.Flags & NodeFlags.Directory) == 0) continue;
-            if ((child.Flags & NodeFlags.ReparsePoint) != 0) continue; // never follow junctions/symlinks
-            if (depth + 1 >= MaxDepth)
+            foreach (FsNode child in children)
             {
-                RecordError("max_depth", dirPath);
-                continue;
-            }
+                if ((child.Flags & NodeFlags.Directory) == 0) continue;
+                // Only name-surrogate links (symlink/junction/mount-point, tag family 0xA0)
+                // are never followed. Other reparse tags (e.g. cloud 0x90 dirs) are ordinary
+                // directories with real children and must be descended. Tag 0 means the
+                // fallback info class hid the tag — stay conservative and skip (old behavior).
+                if ((child.Flags & NodeFlags.ReparsePoint) != 0)
+                {
+                    bool skip = true;
+                    if (_dirReparseTags.TryRemove(child, out uint tag) && tag != 0)
+                        skip = (tag >> 24) == 0xA0;
+                    if (skip) continue;
+                }
+                if (depth + 1 >= MaxDepth)
+                {
+                    RecordError("max_depth", dirPath);
+                    continue;
+                }
 
-            // Keep the queue bounded. If every worker is producing while it is full, process
-            // the child inline so producers cannot deadlock waiting for themselves to read.
-            Interlocked.Increment(ref _active);
-            var next = new Item(PathUtils.JoinDir(dirPath, child.Name), child, depth + 1);
-            if (!writer.TryWrite(next))
-                await HandleItem(next, writer, ct).ConfigureAwait(false);
+                // Keep the queue bounded. If every worker is producing while it is full, process
+                // the child inline so producers cannot deadlock waiting for themselves to read.
+                Interlocked.Increment(ref _active);
+                var next = new Item(JoinDirFast(dirPath, child.Name), child, depth + 1, volSerial);
+                if (!writer.TryWrite(next))
+                    await HandleItem(next, writer, ct).ConfigureAwait(false);
+            }
+        }
+        finally
+        {
+            ReturnList(children);
         }
 
-        if (children.Count > 20_000)
-            RecordError("huge_fanout", $"{dirPath} -> {children.Count} entries");
+        if (childCount > 20_000)
+            RecordError("huge_fanout", $"{dirPath} -> {childCount} entries");
 
         long dirs = Interlocked.Read(ref _dirsSeen);
         for (int i = 0; i < SnapshotPoints.Length; i++)
@@ -334,23 +387,52 @@ public sealed class GenericScanner : IDiskScanner
         }
     }
 
+    /// <summary>Per-worker JoinDir reusing the thread's StringBuilder (no intermediate "\\" string).</summary>
+    private string JoinDirFast(string dir, string name)
+    {
+        var sb = _pathBuilder.Value!;
+        sb.Clear();
+        sb.Append(dir);
+        char last = dir[dir.Length - 1];
+        if (last != '\\' && last != '/') sb.Append('\\');
+        sb.Append(name);
+        return sb.ToString();
+    }
+
+    private List<FsNode> RentList()
+    {
+        var stack = _listPool.Value!;
+        return stack.Count > 0 ? stack.Pop() : new List<FsNode>(128);
+    }
+
+    private void ReturnList(List<FsNode> list)
+    {
+        list.Clear();
+        // Don't pool huge fanouts — let the large array go rather than pinning it per worker.
+        if (list.Capacity > 4096) return;
+        _listPool.Value!.Push(list);
+    }
+
     /// <summary>
     /// Enumerates one directory; recovers from malformed batches by retrying THIS directory
-    /// with the fallback info class. The capability downgrade (API rejects the class) stays
-    /// global, but a shape-mismatch never poisons parsing for other directories.
+    /// with the fallback info class. The capability downgrade (API rejects the class) is
+    /// scoped per volume serial, but a shape-mismatch never poisons parsing for other directories.
     /// </summary>
-    private List<FsNode> Enumerate(string dirPath, CancellationToken ct)
+    private List<FsNode> Enumerate(string dirPath, uint volSerial, CancellationToken ct)
     {
+        // Hoist the long-path prefix once per directory: both the initial attempt and any
+        // fallback retry share one handle path, so Extend never runs per batch or per retry.
+        string extendedPath = PathUtils.Extend(dirPath);
         try
         {
-            return EnumerateCore(dirPath, extdRequested: true, ct);
+            return EnumerateCore(dirPath, extendedPath, extdRequested: true, volSerial, ct);
         }
         catch (CorruptBatchException)
         {
             RecordError("extd_corrupt_retry_full", dirPath);
             try
             {
-                return EnumerateCore(dirPath, extdRequested: false, ct);
+                return EnumerateCore(dirPath, extendedPath, extdRequested: false, volSerial, ct);
             }
             catch (CorruptBatchException)
             {
@@ -362,15 +444,15 @@ public sealed class GenericScanner : IDiskScanner
         {
             // Class rejected mid-enumeration: restart cleanly with the fallback layout
             // so streams are never mixed on one handle.
-            return EnumerateCore(dirPath, extdRequested: false, ct);
+            return EnumerateCore(dirPath, extendedPath, extdRequested: false, volSerial, ct);
         }
     }
 
     /// <summary>Enumerates one directory, returning fully-built child nodes.</summary>
-    private unsafe List<FsNode> EnumerateCore(string dirPath, bool extdRequested, CancellationToken ct)
+    private unsafe List<FsNode> EnumerateCore(string dirPath, string extendedPath, bool extdRequested, uint volSerial, CancellationToken ct)
     {
         IntPtr hDir = NativeMethods.CreateFileW(
-            PathUtils.Extend(dirPath),
+            extendedPath,
             NativeMethods.FILE_LIST_DIRECTORY,
             NativeMethods.FILE_SHARE_READ | NativeMethods.FILE_SHARE_WRITE | NativeMethods.FILE_SHARE_DELETE,
             IntPtr.Zero,
@@ -386,12 +468,14 @@ public sealed class GenericScanner : IDiskScanner
             throw new Win32Exception(err);
         }
 
-        var result = new List<FsNode>(128);
+        List<FsNode> result = RentList();
+        result.Clear();
         byte[] buf = _buffer.Value ??= new byte[InitialBufferSize];
         // Capture the information class for this handle. A different worker may
-        // discover a volume-wide downgrade while this directory is in flight; it
+        // downgrade the same volume while this directory is in flight; it
         // must not make us switch record layouts halfway through one enumeration.
-        bool useExtd = extdRequested && Volatile.Read(ref _useExtdClass);
+        bool useExtd = extdRequested && ExtdEnabled(volSerial);
+        bool owned = false;
 
         try
         {
@@ -419,7 +503,8 @@ public sealed class GenericScanner : IDiskScanner
                         // Restart this directory under the fallback layout — never mix classes
                         // on one handle (enumeration position semantics differ per class).
                         // finally-block closes the handle; wrapper restarts cleanly.
-                        Volatile.Write(ref _useExtdClass, false);
+                        // Scoped per volume serial (0 = unknown stays sticky for unknown only).
+                        _extdByVolume[volSerial] = false;
                         throw new CapabilityDowngradeException();
                     }
                     if (err == NativeMethods.ERROR_MORE_DATA && buf.Length < MaxBufferSize)
@@ -446,10 +531,13 @@ public sealed class GenericScanner : IDiskScanner
                 if (parsed == 0) break; // defensive: no forward progress possible
 
             }
+            owned = true;
         }
         finally
         {
             NativeMethods.CloseHandle(hDir);
+            // On failure the rented list stays pooled; on success ownership moves to the caller.
+            if (!owned) ReturnList(result);
         }
 
         return result;
@@ -465,6 +553,23 @@ public sealed class GenericScanner : IDiskScanner
 
         byte* cur = basePtr;
         byte* end = basePtr + bufferLength;
+        // Once-per-batch layout probe: if the first record cannot match the assumed class,
+        // fail fast so the caller restarts with the fallback layout without scanning further.
+        // Per-record checks below still guard every entry; this only short-circuits the common
+        // wrong-class case (extd vs full mismatch) after a single header read.
+        if (cur + nameOffset + 2 > end) return 0;
+        {
+            uint firstNext = *(uint*)cur;
+            if ((firstNext & 7) != 0) return -1;
+            if (cur + offNameBytes + 4 <= end)
+            {
+                uint firstNameBytes = *(uint*)(cur + offNameBytes);
+                if (firstNameBytes == 0 || (firstNameBytes & 1) != 0 || firstNameBytes > 65536) return -1;
+            }
+        }
+        // The probe above validated the assumed layout for this batch: the extd path below
+        // can trust field offsets and use the vectorized NUL scan.
+        bool trustedExtd = extd;
         int count = 0;
         LocalTally tally = _local.Value!;
         long files0 = tally.Files, dirs0 = tally.Dirs, bytes0 = tally.Bytes;
@@ -505,10 +610,19 @@ public sealed class GenericScanner : IDiskScanner
 
             // Embedded NULs indicate we are reading a record with the wrong layout —
             // never enqueue such names (they produce phantom paths downstream).
-            bool hasNul = false;
-            for (int ci = 0; ci < nameLen; ci++)
+            bool hasNul;
+            if (trustedExtd)
             {
-                if (namePtr[ci] == '\0') { hasNul = true; break; }
+                // Fast path: layout already validated once per batch, so a SIMD scan suffices.
+                hasNul = new ReadOnlySpan<char>(namePtr, nameLen).IndexOf('\0') >= 0;
+            }
+            else
+            {
+                hasNul = false;
+                for (int ci = 0; ci < nameLen; ci++)
+                {
+                    if (namePtr[ci] == '\0') { hasNul = true; break; }
+                }
             }
             if (hasNul)
             {
@@ -526,16 +640,19 @@ public sealed class GenericScanner : IDiskScanner
                 Name = new string(namePtr, 0, nameLen),
             };
 
-            bool isDir = ApplyAttributes(node, *(uint*)(cur + offAttributes),
-                extd ? *(uint*)(cur + NativeMethods.Extd_ReparsePointTag) : 0);
+            uint reparseTag = extd ? *(uint*)(cur + NativeMethods.Extd_ReparsePointTag) : 0;
+            bool isDir = ApplyAttributes(node, *(uint*)(cur + offAttributes), reparseTag);
+            if (isDir && (node.Flags & NodeFlags.ReparsePoint) != 0)
+                _dirReparseTags[node] = reparseTag;
 
-            bool hardlinkDup = false;
-            if (!isDir && fileKey != 0)
-                hardlinkDup = !_seenFileIds[(int)((uint)fileKey.GetHashCode() & (DedupShards - 1))].TryAdd(fileKey, 0);
-            if (hardlinkDup)
+            // Batch-time dup detection only marks; sizing is resolved deterministically
+            // post-join by lexicographic path so concurrent arrival order cannot move
+            // bytes between folders. Keep the real size here; DeterminizeHardlinks zeroes losers.
+            if (!isDir && fileKey != 0 &&
+                !_seenFileIds[(int)((uint)fileKey.GetHashCode() & (DedupShards - 1))].TryAdd(fileKey, 0))
             {
                 node.Flags |= NodeFlags.Hardlinked;
-                node.AllocatedSize = 0;
+                _hardlinkDupKeys.TryAdd(fileKey, 0);
             }
 
             sink.Add(node);
@@ -597,20 +714,12 @@ public sealed class GenericScanner : IDiskScanner
             node.AllocatedSize = 0; // totals come from children
         }
 
-        // Reparse points: symlinks (tag 0xA*) stay as-is; cloud-filter placeholders
-        // (tag family 0x9*) are not resident locally — their reported AllocationSize is
-        // the remote/cloud size and MUST NOT count toward on-disk usage.
+        // Reparse points keep the flag regardless of tag; traversal is gated in Process
+        // (only name-surrogate family 0xA0 is skipped). Dehydrated placeholders are
+        // sparse and already report AllocationSize == 0, so no tag-family zeroing here:
+        // only OFFLINE|RECALL_ON_* below zeroes + marks CloudPlaceholder.
         if ((attrs & REPARSE) != 0)
-        {
             node.Flags |= NodeFlags.ReparsePoint;
-            uint family = reparseTag >> 24;
-            if (!isDir && family == 0x90)
-            {
-                node.Flags |= NodeFlags.CloudPlaceholder;
-                node.AllocatedSize = 0;
-                return false;
-            }
-        }
 
         if (!isDir && (attrs & (OFFLINE | RECALL_ON_OPEN | RECALL_ON_DATA_ACCESS)) != 0)
         {
@@ -618,5 +727,77 @@ public sealed class GenericScanner : IDiskScanner
             node.AllocatedSize = 0; // placeholder content is not resident locally
         }
         return isDir;
+    }
+
+    private bool ExtdEnabled(uint volSerial) =>
+        !_extdByVolume.TryGetValue(volSerial, out bool enabled) || enabled;
+
+    /// <summary>
+    /// Deterministic post-join hardlink resolution: groups file nodes by
+    /// (FileKey, LogicalSize) for keys known to collide, keeps AllocatedSize only on
+    /// the lexicographically-first full path, zeroes losers. Returns total bytes zeroed
+    /// so Scan can keep _bytesSeen consistent with the tree. Single-threaded (post-join).
+    /// LogicalSize must match to guard low-64 collisions on ReFS/SMB (FILE_ID_128 truncation).
+    /// </summary>
+    private long DeterminizeHardlinks(FsNode root)
+    {
+        var groups = new Dictionary<(long Key, ulong Size), List<FsNode>>();
+        var stack = new Stack<FsNode>();
+        stack.Push(root);
+        while (stack.Count > 0)
+        {
+            FsNode n = stack.Pop();
+            var children = n.Children;
+            if (children is null) continue;
+            foreach (FsNode child in children)
+            {
+                if ((child.Flags & NodeFlags.Directory) != 0)
+                {
+                    stack.Push(child);
+                    continue;
+                }
+                if (child.FileKey == 0) continue;
+                if (!_hardlinkDupKeys.ContainsKey(child.FileKey)) continue;
+                var k = (child.FileKey, child.LogicalSize);
+                if (!groups.TryGetValue(k, out List<FsNode>? list))
+                    groups[k] = list = new List<FsNode>(2);
+                list.Add(child);
+            }
+        }
+
+        long zeroed = 0;
+        foreach (List<FsNode> members in groups.Values)
+        {
+            if (members.Count == 1)
+            {
+                // Spurious batch-time mark: same low-64 FileKey but no size match.
+                // Not a hardlink — clear the flag, keep the bytes.
+                members[0].Flags &= ~NodeFlags.Hardlinked;
+                continue;
+            }
+            FsNode? best = null;
+            string? bestPath = null;
+            foreach (FsNode m in members)
+            {
+                string p = m.GetPath();
+                if (best is null || string.CompareOrdinal(p, bestPath) < 0)
+                {
+                    best = m;
+                    bestPath = p;
+                }
+            }
+            foreach (FsNode m in members)
+            {
+                if (ReferenceEquals(m, best))
+                    m.Flags &= ~NodeFlags.Hardlinked;
+                else
+                {
+                    m.Flags |= NodeFlags.Hardlinked;
+                    zeroed += (long)m.AllocatedSize;
+                    m.AllocatedSize = 0;
+                }
+            }
+        }
+        return zeroed;
     }
 }

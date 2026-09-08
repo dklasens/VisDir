@@ -22,6 +22,7 @@ public struct MftEntryInfo
     public bool Compressed;
     public bool Sparse;
     public bool Reparse;                 // FILE_ATTRIBUTE_REPARSE_POINT seen in SI or FILE_NAME
+    public uint ReparseTag;              // $REPARSE_POINT tag (0 when absent)
     public bool Offline;                 // OFFLINE or RECALL_ON_* seen in SI or FILE_NAME (cloud placeholder)
 
     public MftEntryInfo() { }
@@ -39,6 +40,7 @@ public static unsafe class NtfsRecordParser
     private const uint AttrFileName = 0x00000030;
     private const uint AttrData = 0x00000080;
     private const uint AttrIndexAllocation = 0x000000A0;
+    private const uint AttrReparsePoint = 0x000000C0;
     private const uint AttributeEndMarker = 0xFFFFFFFF;
 
     public static bool LooksLikeFileRecord(ReadOnlySpan<byte> buffer) =>
@@ -62,12 +64,19 @@ public static unsafe class NtfsRecordParser
 
         ushort usaOffset = *(ushort*)(rec + 0x04);
         ushort usaCount = *(ushort*)(rec + 0x06);
+        int stride = 512;
+        if (usaCount > 1)
+        {
+            int s = recordLength / (usaCount - 1);
+            if (s >= 512 && s <= recordLength && (s & (s - 1)) == 0)
+                stride = s;
+        }
         if (usaCount >= 1 && usaOffset >= 0x30 && usaOffset + usaCount * 2U <= (uint)recordLength)
         {
             ushort sequence = *(ushort*)(rec + usaOffset);
             for (int i = 1; i < usaCount; i++)
             {
-                int endOfSector = i * 512 - 2;
+                int endOfSector = i * stride - 2;
                 if (endOfSector + 2 > recordLength) return false;
                 ushort* slot = (ushort*)(rec + endOfSector);
                 if (*slot != sequence) return false;
@@ -141,12 +150,19 @@ public static unsafe class NtfsRecordParser
 
         // Update-sequence fixup: the last 2 bytes of every 512-byte sector are stale and
         // must equal the sequence word before being replaced by the corrector values.
+        int stride = 512;
+        if (usaCount > 1)
+        {
+            int s = recordLength / (usaCount - 1);
+            if (s >= 512 && s <= recordLength && (s & (s - 1)) == 0)
+                stride = s;
+        }
         if (usaCount >= 1 && usaOffset >= 0x30 && usaOffset + usaCount * 2U <= (uint)recordLength)
         {
             ushort sequence = *(ushort*)(rec + usaOffset);
             for (int i = 1; i < usaCount; i++)
             {
-                int endOfSector = i * 512 - 2;
+                int endOfSector = i * stride - 2;
                 if (endOfSector + 2 > recordLength) { failStage = FailFixup; return false; }
                 ushort* slot = (ushort*)(rec + endOfSector);
                 if (*slot != sequence) { failStage = FailFixup; return false; } // torn/corrupt record
@@ -183,7 +199,10 @@ public static unsafe class NtfsRecordParser
 
             uint attrLen = *(uint*)(rec + off + 4);
             if (attrLen < 0x10 || off + attrLen > limit || (attrLen & 7) != 0)
-                break; // truncated/torn tail: keep what we parsed so far
+            {
+                if (!info.HasFileName) return false; // nothing usable: zero-byte-node fix
+                break; // torn tail: keep what we parsed so far
+            }
 
             bool nonResident = rec[off + 8] != 0;
             uint attrFlags = *(ushort*)(rec + off + 0x0C);
@@ -207,6 +226,14 @@ public static unsafe class NtfsRecordParser
                     if (*(ulong*)(rec + off + 0x10) == 0)
                         info.IndexAllocationSize += *(ulong*)(rec + off + 0x28);
                     break;
+                case AttrReparsePoint:
+                    ParseReparsePoint(rec, off, attrLen, ref info);
+                    break;
+
+                case AttrAttributeList:
+                    // Extension contents resolve via BaseRecordNumber fold in
+                    // NtfsMftScanner.MergeExtensionRecords; nothing to record here.
+                    break;
             }
 
             off += attrLen;
@@ -220,25 +247,25 @@ public static unsafe class NtfsRecordParser
         if (nonResidentCheck(rec, off)) return; // FILE_NAME is always resident
         uint valueOffset = *(ushort*)(rec + off + 0x14);
         uint valueLength = *(uint*)(rec + off + 0x10);
-        if (valueOffset + valueLength > attrLen || valueLength < 0x42) return;
+        if ((ulong)valueOffset + valueLength > attrLen || valueLength < 0x42) return;
 
         byte* v = rec + off + valueOffset;
-        info.ParentRecordNumber = *(ulong*)v & 0x0000FFFFFFFFFFFF;
-
         byte nameLen = v[0x40];
         byte ns = v[0x41];
         if (nameLen == 0 || valueLength < 0x42 + (uint)nameLen * 2) return;
 
-        info.FileNameLinks++;
+        if (ns != 2) info.FileNameLinks++;
 
         // Flags DWORD at value+0x38 (allocated/real sizes precede it; 0x42 minimum
         // length already validated above, so this read is in bounds).
         ApplyAttributeFlags(*(uint*)(v + 0x38), ref info);
 
         // Prefer WIN32 names over DOS-mangled ones; POSIX/BOTH acceptable.
+        // DOS (ns==2) keeps rank 1 so it wins only when nothing better was seen.
         int rank = ns switch { 1 => 4, 3 => 3, 0 => 2, _ => 1 };
         if (rank <= bestNameRank && info.HasFileName) return;
 
+        info.ParentRecordNumber = *(ulong*)v & 0x0000FFFFFFFFFFFF;
         info.Name = new string((char*)(v + 0x42), 0, nameLen);
         info.HasFileName = true;
         bestNameRank = rank;
@@ -249,7 +276,7 @@ public static unsafe class NtfsRecordParser
         if (nonResidentCheck(rec, off)) return; // STANDARD_INFORMATION is always resident
         uint valueOffset = *(ushort*)(rec + off + 0x14);
         uint valueLength = *(uint*)(rec + off + 0x10);
-        if (valueOffset + valueLength > attrLen || valueLength < 0x24) return;
+        if ((ulong)valueOffset + valueLength > attrLen || valueLength < 0x24) return;
         ApplyAttributeFlags(*(uint*)(rec + off + valueOffset + 0x20), ref info);
     }
 
@@ -296,7 +323,11 @@ public static unsafe class NtfsRecordParser
             return;
         }
 
-        ulong alloc = *(ulong*)(rec + off + 0x28);
+        // Compressed/sparse streams carry the on-disk allocation as CompressedSize
+        // at +0x40 (header grows to 0x48); +0x28 is the uncompressed logical size.
+        bool isCompressedOrSparse = (attrFlags & 0x8001) != 0;
+        if (isCompressedOrSparse && attrLen < 0x48) return;
+        ulong alloc = isCompressedOrSparse ? *(ulong*)(rec + off + 0x40) : *(ulong*)(rec + off + 0x28);
         ulong real = *(ulong*)(rec + off + 0x30);
 
         if (named)
@@ -311,6 +342,16 @@ public static unsafe class NtfsRecordParser
 
         if ((attrFlags & 0x0001) != 0) info.Compressed = true;
         if ((attrFlags & 0x8000) != 0) info.Sparse = true;
+    }
+
+    private static void ParseReparsePoint(byte* rec, uint off, uint attrLen, ref MftEntryInfo info)
+    {
+        if (nonResidentCheck(rec, off)) return; // $REPARSE_POINT is resident
+        uint valueOffset = *(ushort*)(rec + off + 0x14);
+        uint valueLength = *(uint*)(rec + off + 0x10);
+        if ((ulong)valueOffset + valueLength > attrLen || valueLength < 4) return;
+        uint tag = *(uint*)(rec + off + valueOffset);
+        if (tag != 0 && info.ReparseTag == 0) info.ReparseTag = tag; // first non-zero wins
     }
 
     private static bool nonResidentCheck(byte* rec, uint off) => rec[off + 8] != 0;

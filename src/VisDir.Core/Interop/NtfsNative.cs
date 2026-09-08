@@ -14,6 +14,19 @@ public static unsafe class NtfsNative
     public const uint ShareReadWriteDelete =
         NativeMethods.FILE_SHARE_READ | NativeMethods.FILE_SHARE_WRITE | NativeMethods.FILE_SHARE_DELETE;
     public const uint OpenExisting = NativeMethods.OPEN_EXISTING;
+    public const uint FileFlagOverlapped = 0x40000000;
+    public const int ErrorIoPending = 997;
+    public const uint Infinite = 0xFFFFFFFF;
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct OVERLAPPED
+    {
+        public UIntPtr Internal;
+        public UIntPtr InternalHigh;
+        public uint Offset;
+        public uint OffsetHigh;
+        public IntPtr hEvent;
+    }
 
     // FILE_*_INFORMATION attribute flags (record-level).
     public const ushort MftRecordInUse = 0x0001;
@@ -63,4 +76,23 @@ public static unsafe class NtfsNative
         long liDistanceToMove,
         out long lpNewFilePointer,
         uint dwMoveMethod);
+
+    // Overlapped double-buffer support (MFT Tier-1 only): the existing ReadFile above
+    // doubles as the async entry point by passing an OVERLAPPED* as lpOverlapped.
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    public static extern IntPtr CreateEventW(
+        IntPtr lpEventAttributes,
+        [MarshalAs(UnmanagedType.Bool)] bool bManualReset,
+        [MarshalAs(UnmanagedType.Bool)] bool bInitialState,
+        string? lpName);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern uint WaitForSingleObject(IntPtr hHandle, uint dwMilliseconds);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool GetOverlappedResult(
+        IntPtr hFile,
+        OVERLAPPED* lpOverlapped,
+        out uint lpNumberOfBytesTransferred,
+        [MarshalAs(UnmanagedType.Bool)] bool bWait);
 }
