@@ -165,9 +165,11 @@ public sealed partial class UpdateService
         CancellationToken ct = default)
     {
         string tempDir = EnsureSecureTempRoot();
+        CleanupStalePartials(tempDir);
         string zipPath = Path.Combine(tempDir, $"VisDir-{release.Version}.zip");
-        string partialPath = zipPath + ".partial";
-        TryDeleteFile(partialPath);
+        // Unique per attempt: a second writer (another instance, a reopened dialog,
+        // a cancel-then-retry) must never share an exclusively-locked path.
+        string partialPath = NewUniquePartialPath(zipPath);
 
         try
         {
@@ -179,9 +181,11 @@ public sealed partial class UpdateService
                 throw new InvalidDataException($"Update download size {totalBytes:N0} is outside the accepted range.");
 
             await using var contentStream = await response.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
-            await using var fileStream = new FileStream(
-                partialPath, FileMode.Create, FileAccess.Write, FileShare.None, 128 * 1024,
-                FileOptions.Asynchronous | FileOptions.SequentialScan);
+            await using var fileStream = await WithFileLockRetryAsync(
+                () => new FileStream(
+                    partialPath, FileMode.CreateNew, FileAccess.Write, FileShare.None, 128 * 1024,
+                    FileOptions.Asynchronous | FileOptions.SequentialScan),
+                ct).ConfigureAwait(false);
             using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
             var buffer = new byte[128 * 1024];
             long totalRead = 0;
@@ -206,7 +210,7 @@ public sealed partial class UpdateService
                     Convert.FromHexString(actualHash), Convert.FromHexString(release.Sha256)))
                 throw new InvalidDataException("The downloaded update failed SHA-256 verification.");
 
-            File.Move(partialPath, zipPath, overwrite: true);
+            await WithFileLockRetryAsync(() => { File.Move(partialPath, zipPath, overwrite: true); return true; }, ct).ConfigureAwait(false);
             return zipPath;
         }
         catch
@@ -604,6 +608,50 @@ public sealed partial class UpdateService
     internal sealed record UpdatePlan(
         string AppDir, string StagedDir, string RelativeExe, int ProcessId, string OperationId, string MarkerPath,
         string ExpectedSignerThumbprint);
+
+    /// <summary>Derives a fresh partial-download path beside <paramref name="zipPath"/>.</summary>
+    internal static string NewUniquePartialPath(string zipPath) =>
+        $"{zipPath}.{Guid.NewGuid():N}.partial";
+
+    private const int SharingViolationHResult = unchecked((int)0x80070020);
+
+    private static bool IsSharingViolation(IOException ex) => ex.HResult == SharingViolationHResult;
+
+    /// <summary>Retries file open/move across transient locks (second instance, AV/indexer).</summary>
+    internal static async Task<T> WithFileLockRetryAsync<T>(Func<T> open, CancellationToken ct)
+    {
+        const int maxAttempts = 4;
+        for (int attempt = 0; ; attempt++)
+        {
+            ct.ThrowIfCancellationRequested();
+            try
+            {
+                return open();
+            }
+            catch (IOException ex) when (IsSharingViolation(ex) && attempt + 1 < maxAttempts)
+            {
+                await Task.Delay(250 << attempt, ct).ConfigureAwait(false);
+            }
+        }
+    }
+
+    /// <summary>Best-effort removal of partials orphaned by killed runs (legacy shared names too).</summary>
+    private static void CleanupStalePartials(string tempDir)
+    {
+        try
+        {
+            DateTime cutoff = DateTime.UtcNow - TimeSpan.FromDays(2);
+            foreach (string f in Directory.EnumerateFiles(tempDir, "VisDir-*.partial*"))
+            {
+                try
+                {
+                    if (File.GetLastWriteTimeUtc(f) < cutoff) TryDeleteFile(f);
+                }
+                catch { }
+            }
+        }
+        catch { }
+    }
 
     private static void TryDeleteFile(string path)
     {

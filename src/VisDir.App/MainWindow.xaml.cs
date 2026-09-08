@@ -1247,6 +1247,9 @@ public partial class MainWindow : Window
     private async void OnUpdateActionClick(object sender, RoutedEventArgs e)
     {
         if (_availableRelease is null) return;
+        // A download is already in flight: starting another would share an
+        // exclusively-locked path and fail with a sharing violation.
+        if (_isDownloadingUpdate) return;
 
         // If already downloaded, apply and restart
         if (!string.IsNullOrEmpty(_downloadedZipPath) && File.Exists(_downloadedZipPath))
@@ -1269,8 +1272,9 @@ public partial class MainWindow : Window
 
         // Otherwise, download update
         _isDownloadingUpdate = true;
+        var downloadCts = new CancellationTokenSource();
         _updateDownloadCts?.Dispose();
-        _updateDownloadCts = new CancellationTokenSource();
+        _updateDownloadCts = downloadCts;
         UpdateActionButton.IsEnabled = false;
         UpdateCancelButton.IsEnabled = true;
         UpdateCancelButton.Content = "Cancel";
@@ -1289,7 +1293,7 @@ public partial class MainWindow : Window
         try
         {
             string zip = await _updateService.DownloadUpdateAsync(
-                _availableRelease, progress, _updateDownloadCts.Token);
+                _availableRelease, progress, downloadCts.Token);
             _downloadedZipPath = zip;
             _isDownloadingUpdate = false;
 
@@ -1323,8 +1327,13 @@ public partial class MainWindow : Window
         }
         finally
         {
-            _updateDownloadCts?.Dispose();
-            _updateDownloadCts = null;
+            // Only clear what we created: a newer attempt owns its own CTS.
+            if (ReferenceEquals(_updateDownloadCts, downloadCts))
+            {
+                downloadCts.Dispose();
+                _updateDownloadCts = null;
+            }
+            else downloadCts.Dispose();
         }
     }
 }

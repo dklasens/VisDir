@@ -3,6 +3,16 @@
 All notable changes to VisDir are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.2.1] - 2026-09-08
+
+### Fixed
+
+- Updater no longer fails with "being used by another process" when two
+  downloads overlap (second instance, reopened dialog, cancel-then-retry):
+  each attempt writes a unique partial path, the dialog refuses re-entrant
+  downloads, and file open/move ride out transient locks (AV/indexer) with
+  retries. Stale partials older than two days are swept at download start.
+
 ## [1.2.0] - 2026-09-08
 
 ### Fixed
