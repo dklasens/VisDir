@@ -1,5 +1,7 @@
 # VisDir
 
+<img width="1437" height="866" alt="image" src="https://github.com/user-attachments/assets/0a03713f-3a6c-4192-9495-61d601c08150" />
+
 > A fast, modern disk space visualizer and analyzer for Windows, inspired by DaisyDisk.
 
 Built with **C# (.NET 10)**, **WPF**, and **SkiaSharp** for high-performance harmonic sunburst rendering, paired with a **raw NTFS Master File Table ($MFT)** scanning engine.
@@ -20,9 +22,6 @@ Built with **C# (.NET 10)**, **WPF**, and **SkiaSharp** for high-performance har
   - Reparse point and directory junction loop protection.
   - Cloud-filter awareness (zeroes non-resident OneDrive placeholders to reflect true physical disk occupancy).
 - **Privacy & Performance**: Zero telemetry and analytics. VisDir only connects to GitHub to check for updates, and otherwise processes scan data locally.
-
-<img width="1437" height="866" alt="image" src="https://github.com/user-attachments/assets/0a03713f-3a6c-4192-9495-61d601c08150" />
-
 
 ---
 
