@@ -14,6 +14,7 @@ Built with **C# (.NET 10)**, **WPF**, and **SkiaSharp** for high-performance har
 - **Dual Scanning Engines**:
   - **Fast NTFS (MFT Engine)**: Reads raw `$MFT` structures sequentially in 32 MiB streaming buffers for fast whole-drive indexing.
   - **Compatible Engine**: High-speed multi-threaded batch scanner (`GetFileInformationByHandleEx`) supporting subfolders, external drives (FAT32/exFAT), and network UNC paths.
+- **Counts differ by design**: FAST counts one node per MFT record; Compatible counts one node per directory entry, so hardlinked files inflate its file count. Sizes are the comparability contract — file counts are not.
 - **Explorer & Shell Integration**:
   - Right-click any sector on the sunburst or item in the contents list to instantly **Reveal in File Explorer** or **Copy Full Path**.
 - **Live Filtering & Breadcrumbs**: Search and filter large directories in real time with proportional capacity gauges.

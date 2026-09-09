@@ -3,6 +3,16 @@
 All notable changes to VisDir are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.2.5] - 2026-09-09
+
+### Fixed
+
+- In-app updates no longer require a code-signing certificate that was never
+  provisioned: Authenticode is enforced only when the running build is itself
+  signed (bootstrap-consistent trust, mirrored in the elevated helper).
+  Unsigned installs update on checksums-manifest integrity; shipping a signed
+  release with a pinned thumbprint raises the gate automatically.
+
 ## [Unreleased]
 
 - Release pipeline signs binaries and the MSI when `WINDOWS_SIGNING_PFX_B64`

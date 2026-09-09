@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using VisDir.App.Update;
 using Xunit;
 
@@ -90,5 +91,92 @@ public class UpdaterDownloadPathTests
         UpdateService.TryDeleteFileWithRetry(path);
         await releaser;
         Assert.False(File.Exists(path));
+    }
+
+    [Fact]
+    public void StagedSignatures_UnsignedRunning_AcceptsUnsignedStaged()
+    {
+        string dir = Path.Combine(Path.GetTempPath(), "visdir-trust-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        var prev = UpdateService.TrustChainValid;
+        UpdateService.TrustChainValid = static _ => false;
+        try
+        {
+            File.WriteAllText(Path.Combine(dir, "VisDir.App.exe"), "unsigned");
+            File.WriteAllText(Path.Combine(dir, "VisDir.Scanner.dll"), "unsigned");
+            UpdateService.VerifyStagedSignatures(dir);
+        }
+        finally
+        {
+            UpdateService.TrustChainValid = prev;
+            Directory.Delete(dir, true);
+        }
+    }
+
+    [Fact]
+    public void StagedSignatures_SignedExpectation_StillRefusesUnsignedStaged()
+    {
+        string dir = Path.Combine(Path.GetTempPath(), "visdir-trust-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        var prev = UpdateService.TrustChainValid;
+        UpdateService.TrustChainValid = static _ => true;
+        try
+        {
+            File.WriteAllText(Path.Combine(dir, "VisDir.App.exe"), "unsigned");
+            File.WriteAllText(Path.Combine(dir, "VisDir.Scanner.dll"), "unsigned");
+            Assert.Throws<InvalidDataException>(() => UpdateService.VerifyStagedSignatures(dir));
+        }
+        finally
+        {
+            UpdateService.TrustChainValid = prev;
+            Directory.Delete(dir, true);
+        }
+    }
+
+    [Fact]
+    public void StagedSignaturesScript_UnsignedRunning_AcceptsUnsignedStaged()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        string root = Path.Combine(Path.GetTempPath(), "visdir-trustps-" + Guid.NewGuid().ToString("N"));
+        string installed = Path.Combine(root, "installed");
+        string staged = Path.Combine(root, "staged");
+        try
+        {
+            Directory.CreateDirectory(installed);
+            Directory.CreateDirectory(staged);
+            File.WriteAllText(Path.Combine(installed, "VisDir.App.exe"), "unsigned");
+            File.WriteAllText(Path.Combine(staged, "VisDir.App.exe"), "unsigned");
+            File.WriteAllText(Path.Combine(staged, "VisDir.Scanner.dll"), "unsigned");
+            string script = UpdateService.UpdateScriptForTests;
+            const string marker = "function Test-StagedSignatures";
+            int start = script.IndexOf(marker, StringComparison.Ordinal);
+            Assert.True(start >= 0, "Test-StagedSignatures not found in update script");
+            int end = script.IndexOf("\nfunction ", start, StringComparison.Ordinal);
+            Assert.True(end > start, "Test-StagedSignatures end not found");
+            string harness = "$plan = [pscustomobject]@{ AppDir='" + installed + "'; RelativeExe='VisDir.App.exe'; ExpectedSignerThumbprint='' }\n"
+                + script.Substring(start, end - start)
+                + "\nTest-StagedSignatures '" + staged + "'\n";
+            string ps1 = Path.Combine(root, "harness.ps1");
+            File.WriteAllText(ps1, harness);
+            var psi = new ProcessStartInfo
+            {
+                FileName = "powershell.exe",
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                CreateNoWindow = true,
+            };
+            psi.ArgumentList.Add("-NoProfile");
+            psi.ArgumentList.Add("-NonInteractive");
+            psi.ArgumentList.Add("-ExecutionPolicy");
+            psi.ArgumentList.Add("Bypass");
+            psi.ArgumentList.Add("-File");
+            psi.ArgumentList.Add(ps1);
+            using Process p = Process.Start(psi)!;
+            string stderr = p.StandardError.ReadToEnd();
+            Assert.True(p.WaitForExit(30_000), "PowerShell harness timed out.");
+            Assert.True(p.ExitCode == 0, "Gate should accept when running exe is unsigned: " + stderr);
+        }
+        finally { try { Directory.Delete(root, true); } catch { } }
     }
 }

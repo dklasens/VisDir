@@ -501,13 +501,26 @@ public sealed partial class UpdateService
 
     /// <summary>
     /// Pinned Authenticode signer thumbprint (hex, case/whitespace-insensitive) that staged update
-    /// binaries must chain to. Set at release-signing time; when empty a valid OS trust chain is
-    /// still required. Unsigned or untrusted binaries always fail.
+    /// binaries must chain to once a signing certificate exists. When empty any valid OS
+    /// trust chain passes. The gate itself is bootstrap-consistent (see below): unsigned
+    /// installs update on checksums-manifest integrity; signed installs enforce Authenticode.
     /// </summary>
     internal static string ExpectedSignerThumbprint { get; set; } = string.Empty;
 
+    /// <summary>Trust-policy probe, stubbed in tests. True when the path chains to OS trust.</summary>
+    internal static Func<string, bool> TrustChainValid = static path =>
+    {
+        try { return WinVerifyTrustEmbedded(path) == 0; }
+        catch { return false; }
+    };
+
     internal static void VerifyStagedSignatures(string stagedDir)
     {
+        // Bootstrap-consistent trust (mirrors Test-StagedSignatures in UpdateScript):
+        // unsigned installs update on checksums-manifest integrity, already verified
+        // before staging; the Authenticode gate engages once a signed build is running.
+        if (!TrustChainValid(Environment.ProcessPath ?? string.Empty))
+            return;
         VerifyAuthenticodeSignature(Path.Combine(stagedDir, "VisDir.App.exe"));
         VerifyAuthenticodeSignature(Path.Combine(stagedDir, "VisDir.Scanner.dll"));
     }
@@ -751,6 +764,12 @@ function Test-UpdatePlan {
     if (-not (Test-Path -LiteralPath $stagedExe)) { throw 'Update plan executable is missing from staging.' }
 }
 function Test-StagedSignatures([string] $Dir) {
+    # Bootstrap-consistent trust (mirrors C# VerifyStagedSignatures): unsigned installs
+    # update on checksums-manifest integrity; the gate engages for signed ones.
+    $runningExe = [System.IO.Path]::GetFullPath((Join-Path ([System.IO.Path]::GetFullPath([string]$plan.AppDir)) ([string]$plan.RelativeExe)))
+    if (-not (Test-Path -LiteralPath $runningExe)) { return }
+    $self = Get-AuthenticodeSignature -LiteralPath $runningExe
+    if ($self.Status -ne 'Valid') { return }
     foreach ($bin in @('VisDir.App.exe', 'VisDir.Scanner.dll')) {
         $sig = Get-AuthenticodeSignature -LiteralPath (Join-Path $Dir $bin)
         if ($sig.Status -ne 'Valid') { throw ("Staged binary '{0}' failed Authenticode verification ({1})." -f $bin, $sig.Status) }
