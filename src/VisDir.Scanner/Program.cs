@@ -15,6 +15,7 @@ public static class ScannerCli
     {
         try
         {
+            TokenPrivilegeManager.TryEnableBackupPrivileges();
             return Run(args);
         }
         catch (OperationCanceledException)
@@ -33,6 +34,7 @@ public static class ScannerCli
 
     private static int Run(string[] args)
     {
+        TokenPrivilegeManager.TryEnableBackupPrivileges();
         string? path = null;
         string? outFile = null;
         bool report = false;

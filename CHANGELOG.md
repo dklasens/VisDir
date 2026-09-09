@@ -3,6 +3,23 @@
 All notable changes to VisDir are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.2.6] - 2026-09-09
+
+### Added
+
+- **Harmonic Palette & Folder-Tree Gradients**:
+  - Replaced the static hue array with a dynamic harmonic chord system for top-level branches, avoiding monochromatic adjacent sectors.
+  - Introduced hierarchical angular gradients across branch sectors: subfolders smoothly fan out across the sector in harmonious hue transitions matching directory structure.
+  - Added radial depth luminance progression (depth 1 anchor to luminous outer rings) and subtle analogous temperature drift with depth.
+  - Added sibling micro-contrast to clearly delineate adjacent subfolders in the same ring.
+  - Dynamic center disk readout: hovering over any sunburst wedge now illuminates the center size readout in that wedge's specific gradient color.
+- **Windows Token Privilege Management (`SeBackupPrivilege`, `SeRestorePrivilege`)**:
+  - Implemented `TokenPrivilegeManager` to enable Windows backup privileges on process tokens, allowing elevated scans to read restricted system locations with backup semantics.
+  - Integrated into `GenericScanner`, `NtfsMftScanner`, and the CLI worker.
+- **Interactive Elevation & Permission UX (DaisyDisk style)**:
+  - Upgraded `ScanWarningBadge` into an interactive amber button with detailed permission explanations and one-click relaunch as Administrator with the Fast NTFS engine.
+  - Added informative hover tooltips to `EngineBadge` and `ScanWarningBadge` explaining Fast NTFS (raw MFT) vs. Compatible (directory traversal) scan contracts.
+
 ## [1.2.5] - 2026-09-09
 
 ### Fixed
@@ -13,13 +30,9 @@ All notable changes to VisDir are documented here. Format follows
   Unsigned installs update on checksums-manifest integrity; shipping a signed
   release with a pinned thumbprint raises the gate automatically.
 
-## [Unreleased]
-
 - Release pipeline signs binaries and the MSI when `WINDOWS_SIGNING_PFX_B64`
   (+ optional `WINDOWS_SIGNING_PFX_PASSWORD`) secrets are configured; without
-  a certificate builds stay unsigned and the updater's Authenticode gate
-  refuses them by design. A code-signing certificate is still required before
-  in-app updates can succeed.
+  a certificate builds stay unsigned.
 
 ## [1.2.4] - 2026-09-09
 

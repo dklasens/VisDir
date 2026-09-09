@@ -99,6 +99,7 @@ public sealed class GenericScanner : IDiskScanner
 
     public ScanResult Scan(ScanOptions options, CancellationToken cancellationToken, IProgress<ScanProgress>? progress)
     {
+        TokenPrivilegeManager.TryEnableBackupPrivileges();
         ResetState();
         VolumeInfo volume = VolumeQuery.Query(options.Path);
 

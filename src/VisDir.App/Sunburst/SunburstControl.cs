@@ -616,7 +616,7 @@ public class SunburstControl : SkiaSharp.Views.WPF.SKElement
     /// <summary>True when <paramref name="node"/> sits outside the hovered branch's lineage.</summary>
     private static bool ShouldDim(SunburstNode node, bool dimActive, int focusBranch) =>
         dimActive && node.Depth > 0 &&
-        (node.IsAggregatedWedge ? focusBranch != int.MinValue : node.BranchIndex != focusBranch);
+        (node.IsAggregatedWedge ? focusBranch != int.MinValue && node.BranchIndex != focusBranch : node.BranchIndex != focusBranch);
 
     private CachedArc? FindCachedArc(FsNode? source) =>
         source is not null && _arcBySource.TryGetValue(source, out CachedArc? arc) ? arc : null;
@@ -725,7 +725,10 @@ public class SunburstControl : SkiaSharp.Views.WPF.SKElement
         canvas.DrawCircle(g.cx, g.cy, g.inner - 1, _centerRimPaint);
 
         float maxW = g.inner * 2f * 0.82f;
-        var accentColor = SystemParameters.HighContrast ? CanvasAccent : new SKColor(0x5C, 0xD6, 0x8D);
+        SKColor nodeAccent = (isHoveringWedge || !isShowingRoot) && FindCachedArc(shown) is { } arc
+            ? arc.HoverFill
+            : new SKColor(0x5C, 0xD6, 0x8D);
+        var accentColor = SystemParameters.HighContrast ? CanvasAccent : nodeAccent;
 
         if (isShowingRoot)
         {

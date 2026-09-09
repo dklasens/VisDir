@@ -72,6 +72,7 @@ public sealed class NtfsMftScanner : IDiskScanner
 
     public ScanResult Scan(ScanOptions options, CancellationToken cancellationToken, IProgress<ScanProgress>? progress)
     {
+        TokenPrivilegeManager.TryEnableBackupPrivileges();
         string requestedPath = PathUtils.NormalizeScanRoot(options.Path);
         VolumeInfo capacity = VolumeQuery.Query(requestedPath);
         string volumeDevice = GetVolumeDevice(requestedPath);

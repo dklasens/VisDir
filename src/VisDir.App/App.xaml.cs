@@ -13,6 +13,8 @@ public partial class App : Application
 {
     protected override void OnStartup(StartupEventArgs e)
     {
+        VisDir.Core.Interop.TokenPrivilegeManager.TryEnableBackupPrivileges();
+
         if (e.Args is ["--worker", .. var workerArgs])
         {
             ShutdownMode = ShutdownMode.OnExplicitShutdown;
@@ -33,7 +35,7 @@ public partial class App : Application
         base.OnStartup(e);
     }
 
-    private static void SafeLog(string message)
+    internal static void SafeLog(string message)
     {
         try
         {

@@ -495,18 +495,25 @@ public partial class MainWindow : Window
         _result = result;
 
         EngineBadge.Visibility = Visibility.Visible;
-        EngineBadgeText.Text = result.EngineName?.Trim().ToLowerInvariant() switch
+        string engineKey = result.EngineName?.Trim().ToLowerInvariant() ?? "";
+        EngineBadgeText.Text = engineKey switch
         {
             "mft" => "FAST NTFS",
             "generic" or "compatible" => "COMPATIBLE",
-            { Length: > 0 } other => other.ToUpperInvariant(),
+            { Length: > 0 } => engineKey.ToUpperInvariant(),
             _ => "SCANNED",
+        };
+        EngineBadge.ToolTip = engineKey switch
+        {
+            "mft" => "Fast NTFS Engine: Directly indexing the Master File Table ($MFT). Bypasses file system overhead and accounts for all physical disk blocks.",
+            "generic" or "compatible" => "Compatible Engine: Scanning via Windows directory traversal. Standard file permissions apply. Run as Administrator for Fast NTFS.",
+            _ => null,
         };
         RescanButton.Visibility = Visibility.Visible;
         if (result.Stats.ErrorCount > 0)
         {
             ScanWarningText.Text = $"{result.Stats.ErrorCount:N0} unreadable location{(result.Stats.ErrorCount == 1 ? "" : "s")}";
-            ScanWarningBadge.ToolTip = "The displayed total is incomplete because one or more locations could not be read.";
+            ScanWarningBadge.ToolTip = "Click to view unreadable location details and options to scan as Administrator.";
             ScanWarningBadge.Visibility = Visibility.Visible;
         }
         else
@@ -527,6 +534,35 @@ public partial class MainWindow : Window
         Burst.Volume = result.Volume;
         NavigateInto(result.Root, recordHistory: false);
         ScanOverlay.Visibility = Visibility.Collapsed;
+    }
+
+    private void OnScanWarningBadgeClick(object sender, RoutedEventArgs e)
+    {
+        if (_result is null || _result.Stats.ErrorCount == 0) return;
+
+        if (!IsElevated())
+        {
+            MessageBoxResult answer = MessageBox.Show(
+                this,
+                $"{_result.Stats.ErrorCount:N0} location(s) could not be read due to Windows access permissions (e.g., System Volume Information, System Restore snapshots, protected system logs).\n\nWould you like to relaunch VisDir as Administrator to scan the entire drive with the Fast NTFS engine?",
+                "Unreadable Locations Detected",
+                MessageBoxButton.YesNo,
+                MessageBoxImage.Warning);
+
+            if (answer == MessageBoxResult.Yes)
+            {
+                RequestElevatedRestart(_result.Root.Name);
+            }
+        }
+        else
+        {
+            MessageBox.Show(
+                this,
+                $"{_result.Stats.ErrorCount:N0} location(s) could not be read. VisDir is running with elevated Administrator privileges, but these locations are currently locked by the operating system or system kernel services.",
+                "Unreadable Locations",
+                MessageBoxButton.OK,
+                MessageBoxImage.Information);
+        }
     }
 
     private int _layoutSequence;

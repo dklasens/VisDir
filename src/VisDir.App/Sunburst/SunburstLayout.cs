@@ -23,6 +23,18 @@ public sealed class SunburstNode
     /// <summary>Number of visible top-level branches — spaces sibling hues evenly.</summary>
     public int BranchCount;
 
+    /// <summary>Starting angle (radians) of the top-level branch sector containing this node.</summary>
+    public double BranchStartAngle;
+
+    /// <summary>Ending angle (radians) of the top-level branch sector containing this node.</summary>
+    public double BranchEndAngle;
+
+    /// <summary>Zero-based index among siblings within the parent node.</summary>
+    public int SiblingIndex;
+
+    /// <summary>Total visible sibling count in the parent node.</summary>
+    public int SiblingCount;
+
     public string DisplayName => Source.Name;
 }
 
@@ -40,11 +52,19 @@ public static class SunburstLayout
             Angle0 = 0,
             Angle1 = FullCircle,
             Depth = 0,
+            BranchStartAngle = 0,
+            BranchEndAngle = FullCircle,
+            SiblingIndex = 0,
+            SiblingCount = 1,
         };
         LayoutChildren(root, minSweepRadians, maxDepth);
         AssignBranches(root);
         root.BranchIndex = -1;
         root.BranchCount = root.Children?.Count ?? 0;
+        root.BranchStartAngle = 0;
+        root.BranchEndAngle = FullCircle;
+        root.SiblingIndex = 0;
+        root.SiblingCount = 1;
         return root;
     }
 
@@ -135,27 +155,49 @@ public static class SunburstLayout
     {
         int count = root.Children?.Count ?? 0;
         if (root.Children is { } kids)
+        {
             for (int i = 0; i < kids.Count; i++)
-                AssignBranch(kids[i], i, count);
+            {
+                kids[i].SiblingIndex = i;
+                kids[i].SiblingCount = kids.Count;
+                AssignBranch(kids[i], i, count, kids[i].Angle0, kids[i].Angle1);
+            }
+        }
         if (root.AggregatedWedge is { } wedge)
         {
             wedge.BranchIndex = -1;
             wedge.BranchCount = count;
+            wedge.BranchStartAngle = wedge.Angle0;
+            wedge.BranchEndAngle = wedge.Angle1;
+            wedge.SiblingIndex = count;
+            wedge.SiblingCount = count + 1;
         }
     }
 
-    private static void AssignBranch(SunburstNode node, int index, int count)
+    private static void AssignBranch(SunburstNode node, int index, int count, double bStart, double bEnd)
     {
         node.BranchIndex = index;
         node.BranchCount = count;
+        node.BranchStartAngle = bStart;
+        node.BranchEndAngle = bEnd;
         if (node.AggregatedWedge is { } wedge)
         {
-            wedge.BranchIndex = -1;
+            wedge.BranchIndex = index;
             wedge.BranchCount = count;
+            wedge.BranchStartAngle = bStart;
+            wedge.BranchEndAngle = bEnd;
+            wedge.SiblingIndex = node.Children?.Count ?? 0;
+            wedge.SiblingCount = (node.Children?.Count ?? 0) + 1;
         }
         if (node.Children is { } kids)
-            foreach (SunburstNode k in kids)
-                AssignBranch(k, index, count);
+        {
+            for (int i = 0; i < kids.Count; i++)
+            {
+                kids[i].SiblingIndex = i;
+                kids[i].SiblingCount = kids.Count;
+                AssignBranch(kids[i], index, count, bStart, bEnd);
+            }
+        }
     }
 
     /// <summary>Hit-test: returns the deepest visible node containing (radiusFraction, angle), or null.</summary>
