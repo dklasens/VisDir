@@ -53,11 +53,17 @@ jobs:
 
       - name: Build & Package win-x64
         shell: pwsh
+        env:
+          SIGNING_PFX_B64: ${{ secrets.WINDOWS_SIGNING_PFX_B64 }}
+          SIGNING_PFX_PASSWORD: ${{ secrets.WINDOWS_SIGNING_PFX_PASSWORD }}
         run: |
           ./scripts/publish.ps1 -Runtime win-x64 -Configuration Release
 
       - name: Build & Package win-arm64
         shell: pwsh
+        env:
+          SIGNING_PFX_B64: ${{ secrets.WINDOWS_SIGNING_PFX_B64 }}
+          SIGNING_PFX_PASSWORD: ${{ secrets.WINDOWS_SIGNING_PFX_PASSWORD }}
         run: |
           ./scripts/publish.ps1 -Runtime win-arm64 -Configuration Release
 
@@ -67,6 +73,13 @@ jobs:
       - name: Build x64 MSI
         shell: pwsh
         run: ./installer/build.ps1 -SkipPublish
+
+      - name: Sign MSI (if cert configured)
+        shell: pwsh
+        env:
+          SIGNING_PFX_B64: ${{ secrets.WINDOWS_SIGNING_PFX_B64 }}
+          SIGNING_PFX_PASSWORD: ${{ secrets.WINDOWS_SIGNING_PFX_PASSWORD }}
+        run: ./scripts/sign-binaries.ps1 -LiteralPath artifacts/installer
 
       - name: Stage release files
         shell: pwsh

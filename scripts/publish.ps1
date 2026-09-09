@@ -41,6 +41,9 @@ if ($LASTEXITCODE -ne 0) { throw 'Application publish failed.' }
 $workerAssembly = Join-Path $publishDir 'VisDir.Scanner.dll'
 if (-not (Test-Path -LiteralPath $workerAssembly)) { throw "Published worker assembly is missing: $workerAssembly" }
 
+# Authenticode before checksums so the manifest covers signed bytes (no-op without cert env).
+& (Join-Path $PSScriptRoot 'sign-binaries.ps1') -LiteralPath $publishDir
+
 $nativeSkia = Join-Path $publishDir "runtimes\$Runtime\native\libSkiaSharp.dll"
 if (Test-Path -LiteralPath $nativeSkia) {
     Copy-Item -LiteralPath $nativeSkia -Destination (Join-Path $publishDir 'libSkiaSharp.dll') -Force

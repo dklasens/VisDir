@@ -3,6 +3,14 @@
 All notable changes to VisDir are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+- Release pipeline signs binaries and the MSI when `WINDOWS_SIGNING_PFX_B64`
+  (+ optional `WINDOWS_SIGNING_PFX_PASSWORD`) secrets are configured; without
+  a certificate builds stay unsigned and the updater's Authenticode gate
+  refuses them by design. A code-signing certificate is still required before
+  in-app updates can succeed.
+
 ## [1.2.4] - 2026-09-09
 
 ### Fixed
