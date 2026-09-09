@@ -179,4 +179,139 @@ public class UpdaterDownloadPathTests
         }
         finally { try { Directory.Delete(root, true); } catch { } }
     }
+
+    [Fact]
+    public void TestAccessDenied_DetectsAccessDeniedExceptions()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        string script = UpdateService.UpdateScriptForTests;
+        const string marker = "function Test-AccessDenied";
+        int start = script.IndexOf(marker, StringComparison.Ordinal);
+        Assert.True(start >= 0, "Test-AccessDenied not found in update script");
+        int end = script.IndexOf("\nfunction ", start, StringComparison.Ordinal);
+        Assert.True(end > start, "Test-AccessDenied end not found");
+
+        string harness = script.Substring(start, end - start) + @"
+$ex1 = New-Object System.UnauthorizedAccessException 'Access denied'
+$ex2 = New-Object System.IO.IOException 'Locked', -2147024891
+$ex3 = New-Object System.Exception 'Wrapper', $ex1
+$ex4 = New-Object System.IO.FileNotFoundException 'Not found'
+
+if (-not (Test-AccessDenied $ex1)) { throw 'Failed on UnauthorizedAccessException' }
+if (-not (Test-AccessDenied $ex2)) { throw 'Failed on HResult -2147024891' }
+if (-not (Test-AccessDenied $ex3)) { throw 'Failed on inner UnauthorizedAccessException' }
+if (Test-AccessDenied $ex4) { throw 'Wrongly flagged FileNotFoundException' }
+";
+        string root = Path.Combine(Path.GetTempPath(), "visdir-accessps-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            string ps1 = Path.Combine(root, "harness.ps1");
+            File.WriteAllText(ps1, harness);
+            var psi = new ProcessStartInfo
+            {
+                FileName = "powershell.exe",
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                CreateNoWindow = true,
+            };
+            psi.ArgumentList.Add("-NoProfile");
+            psi.ArgumentList.Add("-NonInteractive");
+            psi.ArgumentList.Add("-ExecutionPolicy");
+            psi.ArgumentList.Add("Bypass");
+            psi.ArgumentList.Add("-File");
+            psi.ArgumentList.Add(ps1);
+            using Process p = Process.Start(psi)!;
+            string stderr = p.StandardError.ReadToEnd();
+            Assert.True(p.WaitForExit(30_000), "PowerShell harness timed out.");
+            Assert.True(p.ExitCode == 0, "Test-AccessDenied failed: " + stderr);
+        }
+        finally { try { Directory.Delete(root, true); } catch { } }
+    }
+
+    [Fact]
+    public void UpdateSwap_ExecutesFullDirectorySwapWithSubdirectories()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        string tempRoot = Path.Combine(Path.GetTempPath(), "VisDir", "Updates");
+        Directory.CreateDirectory(tempRoot);
+        string operationId = Guid.NewGuid().ToString("N");
+        string staged = Path.Combine(tempRoot, $"staged-{operationId}");
+        string appParent = Path.Combine(Path.GetTempPath(), $"visdir-app-{operationId}");
+        string appDir = Path.Combine(appParent, "App");
+        string planPath = Path.Combine(tempRoot, $"apply-update-{operationId}.json");
+        string markerPath = Path.Combine(tempRoot, $"healthy-{operationId}.marker");
+
+        try
+        {
+            Directory.CreateDirectory(appDir);
+            Directory.CreateDirectory(staged);
+            Directory.CreateDirectory(Path.Combine(staged, "runtimes"));
+
+            File.WriteAllText(Path.Combine(appDir, "VisDir.App.exe"), "v1-app");
+            File.WriteAllText(Path.Combine(staged, "VisDir.App.exe"), "v2-app");
+            File.WriteAllText(Path.Combine(staged, "VisDir.Scanner.dll"), "v2-scanner");
+            File.WriteAllText(Path.Combine(staged, "runtimes", "sub.dll"), "v2-sub");
+
+            string planJson = System.Text.Json.JsonSerializer.Serialize(new
+            {
+                AppDir = appDir,
+                StagedDir = staged,
+                RelativeExe = "VisDir.App.exe",
+                ProcessId = 999999,
+                OperationId = operationId,
+                MarkerPath = markerPath,
+                ExpectedSignerThumbprint = ""
+            });
+            File.WriteAllText(planPath, planJson);
+
+            // Test execution of Invoke-UpdateSwap up to the swap (excluding starting the process)
+            string script = UpdateService.UpdateScriptForTests;
+            string harness = "$plan = Get-Content -LiteralPath '" + planPath.Replace("'", "''") + "' -Raw | ConvertFrom-Json\n"
+                + "$PlanPath = '" + planPath.Replace("'", "''") + "'\n"
+                + script.Substring(script.IndexOf("function Test-AccessDenied", StringComparison.Ordinal))
+                + "\nInvoke-UpdateSwap\n";
+
+            // Replace the Start-Process line in harness with a mock that creates the marker
+            harness = harness.Replace(
+                "$newProcess = Start-Process -FilePath (Join-Path $appDir $plan.RelativeExe) -PassThru",
+                "Set-Content -LiteralPath $plan.MarkerPath 'mock-healthy'\n    $newProcess = [pscustomobject]@{ Id = 1; HasExited = $false }");
+
+            string testPs1 = Path.Combine(tempRoot, $"test-swap-{operationId}.ps1");
+            File.WriteAllText(testPs1, harness);
+
+            var psi = new ProcessStartInfo
+            {
+                FileName = "powershell.exe",
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                CreateNoWindow = true,
+            };
+            psi.ArgumentList.Add("-NoProfile");
+            psi.ArgumentList.Add("-NonInteractive");
+            psi.ArgumentList.Add("-ExecutionPolicy");
+            psi.ArgumentList.Add("Bypass");
+            psi.ArgumentList.Add("-File");
+            psi.ArgumentList.Add(testPs1);
+
+            using Process p = Process.Start(psi)!;
+            string stdout = p.StandardOutput.ReadToEnd();
+            string stderr = p.StandardError.ReadToEnd();
+            Assert.True(p.WaitForExit(30_000), "PowerShell harness timed out.");
+            Assert.True(p.ExitCode == 0, $"Swap failed with exit code {p.ExitCode}:\n{stdout}\n{stderr}");
+
+            Assert.Equal("v2-app", File.ReadAllText(Path.Combine(appDir, "VisDir.App.exe")));
+            Assert.Equal("v2-scanner", File.ReadAllText(Path.Combine(appDir, "VisDir.Scanner.dll")));
+            Assert.Equal("v2-sub", File.ReadAllText(Path.Combine(appDir, "runtimes", "sub.dll")));
+        }
+        finally
+        {
+            try { Directory.Delete(appParent, true); } catch { }
+            try { Directory.Delete(staged, true); } catch { }
+            try { File.Delete(planPath); } catch { }
+            try { File.Delete(markerPath); } catch { }
+        }
+    }
 }

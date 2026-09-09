@@ -3,6 +3,18 @@
 All notable changes to VisDir are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.2.7] - 2026-09-09
+
+### Fixed
+
+- **In-App Self-Update UAC Elevation**:
+  - Restored the missing `Test-AccessDenied` PowerShell function in the update helper script, resolving a fatal `CommandNotFoundException` that silently aborted updates for MSI/`Program Files` installations when requesting UAC elevation.
+  - Pre-created the update candidate folder with `New-Item -ItemType Directory` before copying payload files, preventing `Copy-Item` container-to-leaf corruption errors.
+  - Added `Move-ItemWithRetry` with backoff retries to absorb transient antivirus / Windows Defender scan locks during the atomic directory swap.
+  - Extended `EnsureSecureTempRoot()` ACL to grant `BuiltinAdministratorsSid` full control so elevated update helpers can access the plan and staging payloads.
+  - Added failure logging in the update script's catch block to `%TEMP%\VisDir\Updates\apply-update.log` and graceful fallback to relaunching the installed application if the UAC prompt is declined.
+  - Added unit tests in `UpdaterDownloadTests` covering `Test-AccessDenied` error detection and full directory swap execution.
+
 ## [1.2.6] - 2026-09-09
 
 ### Added

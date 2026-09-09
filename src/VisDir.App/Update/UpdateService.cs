@@ -440,6 +440,12 @@ public sealed partial class UpdateService
                         InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit,
                         PropagationFlags.None,
                         AccessControlType.Allow));
+                    security.AddAccessRule(new FileSystemAccessRule(
+                        new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null),
+                        FileSystemRights.FullControl,
+                        InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit,
+                        PropagationFlags.None,
+                        AccessControlType.Allow));
                     new DirectoryInfo(tempRoot).SetAccessControl(security);
                 }
             }
@@ -738,18 +744,35 @@ $plan = Get-Content -LiteralPath $PlanPath -Raw | ConvertFrom-Json
 $logPath = Join-Path ([System.IO.Path]::GetTempPath()) 'VisDir\Updates\apply-update.log'
 
 function Write-UpdateLog([string] $Message) {
-    Add-Content -LiteralPath $logPath -Value ("{0:o} {1}" -f [DateTimeOffset]::UtcNow, $Message)
+    try {
+        $dir = [System.IO.Path]::GetDirectoryName($logPath)
+        if (-not (Test-Path -LiteralPath $dir)) { [System.IO.Directory]::CreateDirectory($dir) | Out-Null }
+        Add-Content -LiteralPath $logPath -Value ("{0:o} {1}" -f [DateTimeOffset]::UtcNow, $Message)
+    } catch { }
 }
 function Start-InstalledApp([string] $Root) {
     $exe = Join-Path $Root $plan.RelativeExe
     if (Test-Path -LiteralPath $exe) { Start-Process -FilePath $exe | Out-Null }
 }
+function Test-AccessDenied([Exception] $Exception) {
+    for ($current = $Exception; $null -ne $current; $current = $current.InnerException) {
+        if ($current -is [System.UnauthorizedAccessException] -or
+            $current.HResult -eq -2147024891 -or
+            $current.HResult -eq 5 -or
+            $current.Message -match 'Access.*denied|denied.*access|permission') {
+            return $true
+        }
+    }
+    return $false
+}
 function Test-UpdatePlan {
     $tempRoot = ([System.IO.Path]::GetFullPath((Join-Path ([System.IO.Path]::GetTempPath()) 'VisDir\Updates')).TrimEnd('\', '/') + '\')
+    $planDir = ([System.IO.Path]::GetFullPath((Split-Path -Parent $PlanPath)).TrimEnd('\', '/') + '\')
     $stagedDir = [System.IO.Path]::GetFullPath([string]$plan.StagedDir)
     $marker = [System.IO.Path]::GetFullPath([string]$plan.MarkerPath)
     foreach ($p in @($stagedDir, $marker)) {
-        if (-not $p.StartsWith($tempRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+        if (-not ($p.StartsWith($tempRoot, [System.StringComparison]::OrdinalIgnoreCase) -or
+                  $p.StartsWith($planDir, [System.StringComparison]::OrdinalIgnoreCase))) {
             throw 'Update plan escapes the update temp root.'
         }
     }
@@ -779,6 +802,17 @@ function Test-StagedSignatures([string] $Dir) {
         }
     }
 }
+function Move-ItemWithRetry([string] $Path, [string] $Destination) {
+    for ($i = 0; $i -lt 6; $i++) {
+        try {
+            Move-Item -LiteralPath $Path -Destination $Destination -ErrorAction Stop
+            return
+        } catch {
+            if ($i -eq 5) { throw }
+            Start-Sleep -Milliseconds 250
+        }
+    }
+}
 function Invoke-UpdateSwap {
     Test-UpdatePlan
     Test-StagedSignatures ([System.IO.Path]::GetFullPath([string]$plan.StagedDir))
@@ -793,6 +827,7 @@ function Invoke-UpdateSwap {
     $backup = Join-Path $parent ($leaf + '.previous')
 
     if (Test-Path -LiteralPath $candidate) { Remove-Item -LiteralPath $candidate -Recurse -Force }
+    New-Item -ItemType Directory -Path $candidate -Force | Out-Null
     Copy-Item -Path (Join-Path $stagedDir '*') -Destination $candidate -Recurse -Force
     if (-not (Test-Path -LiteralPath (Join-Path $candidate $plan.RelativeExe))) {
         throw 'Candidate installation is missing the application executable.'
@@ -802,13 +837,13 @@ function Invoke-UpdateSwap {
     if (Test-Path -LiteralPath $backup) { Remove-Item -LiteralPath $backup -Recurse -Force }
     $movedOld = $false
     try {
-        Move-Item -LiteralPath $appDir -Destination $backup
+        Move-ItemWithRetry -Path $appDir -Destination $backup
         $movedOld = $true
-        Move-Item -LiteralPath $candidate -Destination $appDir
+        Move-ItemWithRetry -Path $candidate -Destination $appDir
     } catch {
         if ($movedOld -and (Test-Path -LiteralPath $backup)) {
             if (Test-Path -LiteralPath $appDir) { Remove-Item -LiteralPath $appDir -Recurse -Force }
-            Move-Item -LiteralPath $backup -Destination $appDir
+            Move-ItemWithRetry -Path $backup -Destination $appDir
         }
         throw
     }
@@ -827,8 +862,8 @@ function Invoke-UpdateSwap {
         if (-not $newProcess.HasExited) { Stop-Process -Id $newProcess.Id -Force -ErrorAction SilentlyContinue }
         $failed = $appDir + '.failed-' + $plan.OperationId
         if (Test-Path -LiteralPath $failed) { Remove-Item -LiteralPath $failed -Recurse -Force }
-        Move-Item -LiteralPath $appDir -Destination $failed
-        Move-Item -LiteralPath $backup -Destination $appDir
+        Move-ItemWithRetry -Path $appDir -Destination $failed
+        Move-ItemWithRetry -Path $backup -Destination $appDir
         Start-InstalledApp $appDir
         throw 'The updated application did not report a healthy startup.'
     }
@@ -840,12 +875,18 @@ function Invoke-UpdateSwap {
 try {
     Invoke-UpdateSwap
 } catch {
+    Write-UpdateLog ("Swap failed (Elevated={0}): {1}" -f $Elevated, $_.Exception.ToString())
     if (-not $Elevated -and (Test-AccessDenied $_.Exception)) {
-        $psHost = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-        $arguments = @('-NoProfile', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass',
-            '-File', ('"' + $PSCommandPath + '"'), '-PlanPath', ('"' + $PlanPath + '"'), '-Elevated')
-        Start-Process -FilePath $psHost -Verb RunAs -WindowStyle Hidden -ArgumentList $arguments | Out-Null
-        exit 0
+        Write-UpdateLog 'Access denied detected; requesting elevation via UAC.'
+        try {
+            $psHost = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+            $arguments = @('-NoProfile', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass',
+                '-File', ('"' + $PSCommandPath + '"'), '-PlanPath', ('"' + $PlanPath + '"'), '-Elevated')
+            Start-Process -FilePath $psHost -Verb RunAs -WindowStyle Hidden -ArgumentList $arguments | Out-Null
+            exit 0
+        } catch {
+            Write-UpdateLog ("Elevation failed or declined: {0}" -f $_.Exception.Message)
+        }
     }
     Start-InstalledApp ([string]$plan.AppDir)
     exit 1
