@@ -19,6 +19,7 @@ public struct MftEntryInfo
     public ulong AdsAllocatedSize;         // named streams
     public ulong IndexAllocationSize;      // $INDEX_ALLOCATION (directories)
     public int FileNameLinks;              // FILE_NAME attributes seen (hardlink count)
+    public int NameRank;                   // winning $FILE_NAME namespace rank (4 WIN32 .. 1 DOS, 0 none)
     public bool Compressed;
     public bool Sparse;
     public bool Reparse;                 // FILE_ATTRIBUTE_REPARSE_POINT seen in SI or FILE_NAME
@@ -268,6 +269,7 @@ public static unsafe class NtfsRecordParser
         info.ParentRecordNumber = *(ulong*)v & 0x0000FFFFFFFFFFFF;
         info.Name = new string((char*)(v + 0x42), 0, nameLen);
         info.HasFileName = true;
+        info.NameRank = rank;
         bestNameRank = rank;
     }
 

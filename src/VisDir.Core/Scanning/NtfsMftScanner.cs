@@ -537,7 +537,7 @@ public sealed class NtfsMftScanner : IDiskScanner
     /// record (huge/fragmented files spill $DATA instances there, without a $FILE_NAME).
     /// Fold their sizes into the base so tree assembly sees one complete node per file.
     /// </summary>
-    private static void MergeExtensionRecords(Dictionary<long, MftEntryInfo> entries, List<long> extensionRecNos)
+    internal static void MergeExtensionRecords(Dictionary<long, MftEntryInfo> entries, List<long> extensionRecNos)
     {
         if (extensionRecNos.Count == 0) return;
         var removed = new HashSet<long>(extensionRecNos.Count);
@@ -556,12 +556,14 @@ public sealed class NtfsMftScanner : IDiskScanner
             baseInfo.HasPrimaryData |= ext.HasPrimaryData;
             baseInfo.Reparse |= ext.Reparse;
             baseInfo.Offline |= ext.Offline;
-            // Extension segments usually lack $FILE_NAME; when the base does too,
-            // adopt the extension's name/parent so the folded node still links.
-            if (!baseInfo.HasFileName && ext.HasFileName)
+            // Adopt the better-ranked name across the fold boundary: a base holding
+            // only a DOS-mangled name (seen live: base carries DOS-only $FILE_NAME
+            // while WIN32 lives in an extension record) loses to a WIN32 extension.
+            if (ext.HasFileName && ext.NameRank > baseInfo.NameRank)
             {
                 baseInfo.Name = ext.Name;
                 baseInfo.HasFileName = true;
+                baseInfo.NameRank = ext.NameRank;
                 baseInfo.ParentRecordNumber = ext.ParentRecordNumber;
             }
             baseInfo.FileNameLinks += ext.FileNameLinks;
@@ -890,7 +892,7 @@ public sealed class NtfsMftScanner : IDiskScanner
         return root;
     }
 
-    private static void ApplyInfo(FsNode node, in MftEntryInfo e, uint clusterSize)
+    internal static void ApplyInfo(FsNode node, in MftEntryInfo e, uint clusterSize)
     {
         if (e.Reparse) node.Flags |= NodeFlags.ReparsePoint;
 
@@ -913,13 +915,11 @@ public sealed class NtfsMftScanner : IDiskScanner
             if (e.Compressed) node.Flags |= NodeFlags.Compressed;
             if (e.Sparse) node.Flags |= NodeFlags.SparseFile;
 
-            // Cloud placeholders aren't resident locally — their allocation numbers
-            // describe remote content. Mirrors GenericScanner.ApplyAttributes.
-            if (e.Offline)
-            {
-                node.Flags |= NodeFlags.CloudPlaceholder;
-                node.AllocatedSize = 0;
-            }
+            // Recall-marked but resident files (seen live: payloads carrying
+            // RECALL_ON_* with fully allocated runs) bill their parsed allocation:
+            // that number is on-disk truth, and dehydrated placeholders already
+            // report AllocationSize 0 so they are unaffected. Mirrors generic.
+            if (e.Offline) node.Flags |= NodeFlags.CloudPlaceholder;
         }
 
         // Hardlinks: sizes counted once at the canonical (first-seen) link location;

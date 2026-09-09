@@ -690,7 +690,7 @@ public sealed class GenericScanner : IDiskScanner
     /// Note: flags apply to files AND directories alike — junctions/symlinked dirs must
     /// carry ReparsePoint or they would be traversed (double counting, cycles).
     /// </summary>
-    private static bool ApplyAttributes(FsNode node, uint attrs, uint reparseTag)
+    internal static bool ApplyAttributes(FsNode node, uint attrs, uint reparseTag)
     {
         const uint HIDDEN = 0x2;
         const uint SYSTEM = 0x4;
@@ -715,17 +715,16 @@ public sealed class GenericScanner : IDiskScanner
         }
 
         // Reparse points keep the flag regardless of tag; traversal is gated in Process
-        // (only name-surrogate family 0xA0 is skipped). Dehydrated placeholders are
-        // sparse and already report AllocationSize == 0, so no tag-family zeroing here:
-        // only OFFLINE|RECALL_ON_* below zeroes + marks CloudPlaceholder.
+        // (only name-surrogate family 0xA0 is skipped). Dehydrated placeholders
+        // are sparse and already report AllocationSize == 0; recall flags below
+        // only mark CloudPlaceholder.
         if ((attrs & REPARSE) != 0)
             node.Flags |= NodeFlags.ReparsePoint;
 
+        // Recall-marked but resident files bill their enumerated AllocationSize
+        // (on-disk truth; dehydrated placeholders already report 0): flag only.
         if (!isDir && (attrs & (OFFLINE | RECALL_ON_OPEN | RECALL_ON_DATA_ACCESS)) != 0)
-        {
             node.Flags |= NodeFlags.CloudPlaceholder;
-            node.AllocatedSize = 0; // placeholder content is not resident locally
-        }
         return isDir;
     }
 

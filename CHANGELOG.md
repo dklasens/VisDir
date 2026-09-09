@@ -3,6 +3,19 @@
 All notable changes to VisDir are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.2.4] - 2026-09-09
+
+### Fixed
+
+- Both engines bill recall-marked but resident files instead of zeroing them.
+  Seen live: a 189 GB game install carrying `RECALL_ON_OPEN` with fully
+  allocated runs was hidden to 0 bytes by the placeholder rule. Allocation
+  numbers are on-disk truth; dehydrated placeholders already report 0 either
+  way, so both engines now agree with Explorer and each other.
+- Split-namespace names merge by rank across extension records: a base record
+  holding only a DOS-mangled `$FILE_NAME` (`CALLOF~1`) adopts the WIN32 name
+  from its extension instead of rendering the mangled name.
+
 ## [1.2.3] - 2026-09-08
 
 ### Fixed
