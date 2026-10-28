@@ -18,6 +18,7 @@ public sealed class StartupElevationTests
             Assert.Equal(@"C:\Program Files\VisDir\VisDir.App.exe", start.FileName);
             Assert.Equal(@"C:\Work", start.WorkingDirectory);
             Assert.Equal(arguments, start.ArgumentList);
+            return true;
         });
         Assert.Equal(StartupElevationResult.Relaunched, result);
         Assert.Equal(1, launches);
@@ -46,5 +47,26 @@ public sealed class StartupElevationTests
     {
         Assert.Throws<Win32Exception>(() => StartupElevation.Ensure([], false, "app.exe", "C:\\",
             _ => throw new Win32Exception(2)));
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void UpdateHealthIsReportedOnlyAfterElevatedWindowBecomesReady(bool ready)
+    {
+        var events = new List<string>();
+        StartupElevationResult result = StartupElevation.Ensure([], false, "app.exe", "C:\\",
+            _ => { events.Add("launch-and-wait"); return ready; }, () => events.Add("healthy"));
+        Assert.Equal(StartupElevationResult.Relaunched, result);
+        Assert.Equal(ready ? new[] { "launch-and-wait", "healthy" } : new[] { "launch-and-wait" }, events);
+    }
+
+    [Fact]
+    public void CancelledUpdateLaunchNeverReportsHealthyStartup()
+    {
+        bool healthy = false;
+        Assert.Equal(StartupElevationResult.Cancelled,
+            StartupElevation.Ensure([], false, "app.exe", "C:\\", _ => throw new Win32Exception(1223), () => healthy = true));
+        Assert.False(healthy);
     }
 }

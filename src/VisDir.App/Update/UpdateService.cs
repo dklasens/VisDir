@@ -332,6 +332,8 @@ public sealed partial class UpdateService
             // A failed marker causes the external helper to roll back this update.
         }
     }
+    internal static bool HasPendingStartupHealthCheck =>
+        !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable(HealthMarkerEnvironmentVariable));
     internal static string ExtractUpdateArchive(string zipPath, string? destination = null)
     {
         string staging = Path.GetFullPath(destination ??

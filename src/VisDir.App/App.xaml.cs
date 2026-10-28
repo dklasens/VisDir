@@ -3,6 +3,7 @@ using System.Data;
 using System.IO;
 using System.Windows;
 using VisDir.Scanner;
+using VisDir.App.Update;
 
 namespace VisDir.App;
 
@@ -41,7 +42,8 @@ public partial class App : Application
         {
             StartupElevationResult elevation = StartupElevation.Ensure(e.Args,
                 VisDir.Core.ScanCoordinator.IsElevated(), Environment.ProcessPath
-                    ?? throw new InvalidOperationException("The application path is unavailable."), Environment.CurrentDirectory);
+                    ?? throw new InvalidOperationException("The application path is unavailable."), Environment.CurrentDirectory,
+                reportHealthyStart: UpdateService.HasPendingStartupHealthCheck ? UpdateService.ReportHealthyStart : null);
             if (elevation != StartupElevationResult.Continue)
             {
                 ShutdownMode = ShutdownMode.OnExplicitShutdown;
