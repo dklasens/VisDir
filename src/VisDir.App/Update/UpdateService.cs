@@ -816,6 +816,19 @@ function Move-ItemWithRetry([string] $Path, [string] $Destination) {
         }
     }
 }
+function Get-UpdateHash([string] $Path) {
+    # Use the framework directly: Get-FileHash may be hidden by a parent shell's
+    # incompatible Utility module. Hash verification must remain available.
+    $stream = [System.IO.File]::OpenRead($Path)
+    $sha = $null
+    try {
+        $sha = [System.Security.Cryptography.SHA256]::Create()
+        return [BitConverter]::ToString($sha.ComputeHash($stream)).Replace('-', '')
+    } finally {
+        if ($null -ne $sha) { $sha.Dispose() }
+        $stream.Dispose()
+    }
+}
 function Get-OwnedFiles([string] $Root, [bool] $Verify) {
     $prefix = [System.IO.Path]::GetFullPath($Root).TrimEnd('\', '/') + '\'
     $owned = New-Object 'System.Collections.Generic.Dictionary[string,string]' ([StringComparer]::OrdinalIgnoreCase)
@@ -835,7 +848,7 @@ function Get-OwnedFiles([string] $Root, [bool] $Verify) {
             $relative = $full.Substring($prefix.Length)
             if ($owned.ContainsKey($relative)) { throw 'Duplicate update ownership path.' }
             if ($Verify -and (-not [System.IO.File]::Exists($full) -or
-                (Get-FileHash -LiteralPath $full -Algorithm SHA256).Hash -ne $hash)) { throw "Update checksum failed: $relative" }
+                (Get-UpdateHash $full) -ne $hash)) { throw "Update checksum failed: $relative" }
             $owned.Add($relative, $hash)
         }
         $owned[$manifest.Name] = ''
@@ -888,7 +901,7 @@ function Invoke-UpdateSwap {
         if ($payload.ContainsKey($relative)) { continue }
         $target = Test-InstallPath $appDir $relative
         if ([System.IO.File]::Exists($target) -and $previous[$relative] -ne '' -and
-            (Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash -eq $previous[$relative]) { $remove.Add($relative) }
+            (Get-UpdateHash $target) -eq $previous[$relative]) { $remove.Add($relative) }
     }
     $preserveBackup = $false
     foreach ($relative in $payload.Keys) {
@@ -896,7 +909,7 @@ function Invoke-UpdateSwap {
         if ([System.IO.Directory]::Exists($target)) { throw "Update file conflicts with an existing directory: $relative" }
         if ([System.IO.File]::Exists($target) -and
             (-not $previous.ContainsKey($relative) -or
-             ($previous[$relative] -ne '' -and (Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash -ne $previous[$relative]))) {
+             ($previous[$relative] -ne '' -and (Get-UpdateHash $target) -ne $previous[$relative]))) {
             # A legacy file or a locally edited owned file may contain user data.
             # Keep its original bytes recoverable even when the new release needs its path.
             $preserveBackup = $true

@@ -82,12 +82,14 @@ public class UpdaterDownloadPathTests
     {
         string path = Path.Combine(Path.GetTempPath(), $"visdir-deltest-{Guid.NewGuid():N}.bin");
         await File.WriteAllTextAsync(path, "payload");
-        var locker = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
-        var releaser = Task.Run(async () =>
+        using var locker = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+        // The deletion retries block a thread-pool worker. Release the real lock
+        // independently so a busy CI pool cannot postpone release past the retry budget.
+        var releaser = Task.Factory.StartNew(() =>
         {
-            await Task.Delay(300);
+            Thread.Sleep(300);
             locker.Dispose();
-        });
+        }, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
         UpdateService.TryDeleteFileWithRetry(path);
         await releaser;
         Assert.False(File.Exists(path));

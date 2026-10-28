@@ -76,7 +76,7 @@ public sealed class UpdatePreservationTests
                 // Set inside the child as well: Windows PowerShell may reorder the
                 // inherited module path during its own initialization.
                 File.WriteAllText(harnessPath, "$env:PSModulePath = '" + Quote(foreignModules) +
-                    ";' + $env:PSModulePath\n" + harness);
+                    ";' + $env:PSModulePath\nfunction Get-FileHash { throw 'Incompatible inherited hashing module' }\n" + harness);
             }
             RunPowerShell(harnessPath, foreignModules);
 
