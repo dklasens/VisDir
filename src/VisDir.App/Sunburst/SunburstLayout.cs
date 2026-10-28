@@ -13,6 +13,7 @@ public sealed class SunburstNode
     public List<SunburstNode>? Children;
     public SunburstNode? AggregatedWedge; // "smaller items" bucket
     public bool IsAggregatedWedge;
+    public FsNode? AggregateSource;
 
     public double MidAngle => (Angle0 + Angle1) / 2;
     public double Sweep => Angle1 - Angle0;
@@ -41,10 +42,18 @@ public sealed class SunburstNode
 public static class SunburstLayout
 {
     public const double FullCircle = 2 * Math.PI;
+    public const double MinimumSweep = 0.006;
+    public const int MaxVisibleChildren = 512;
+    public const int MaxLayoutNodes = 4096;
+
+    public static bool IsVisibleChild(FsNode parent, FsNode child, int index, int visibleCount,
+        double minimumSweep = MinimumSweep) =>
+        parent.TotalAllocated > 0 && child.TotalAllocated > 0 && visibleCount < MaxVisibleChildren &&
+        (index == 0 || FullCircle * ((double)child.TotalAllocated / parent.TotalAllocated) >= minimumSweep);
 
     /// <param name="maxDepth">Deepest ring to build. Must match SunburstControl.MaxVisibleDepth;
     /// deeper subtrees rebuild lazily when the user navigates into them.</param>
-    public static SunburstNode Build(FsNode viewRoot, double minSweepRadians = 0.006, int maxDepth = 6)
+    public static SunburstNode Build(FsNode viewRoot, double minSweepRadians = MinimumSweep, int maxDepth = 6, CancellationToken cancellationToken = default)
     {
         var root = new SunburstNode
         {
@@ -57,7 +66,8 @@ public static class SunburstLayout
             SiblingIndex = 0,
             SiblingCount = 1,
         };
-        LayoutChildren(root, minSweepRadians, maxDepth);
+        int remainingNodes = MaxLayoutNodes - 1;
+        LayoutChildren(root, minSweepRadians, maxDepth, ref remainingNodes, cancellationToken);
         AssignBranches(root);
         root.BranchIndex = -1;
         root.BranchCount = root.Children?.Count ?? 0;
@@ -68,87 +78,59 @@ public static class SunburstLayout
         return root;
     }
 
-    private static void LayoutChildren(SunburstNode parent, double minSweep, int maxDepth)
+    private static void LayoutChildren(SunburstNode parent, double minSweep, int maxDepth,
+        ref int remainingNodes, CancellationToken cancellationToken)
     {
-        if (parent.Depth + 1 > maxDepth) return;
+        cancellationToken.ThrowIfCancellationRequested();
+        if (parent.Depth + 1 > maxDepth || remainingNodes < 2) return;
         FsNode src = parent.Source;
-        if (src.Children is not { Count: > 0 } kids) return;
+        if (src.Children is not { Count: > 0 } kids || src.TotalAllocated == 0) return;
 
-        ulong total = src.TotalAllocated;
-        if (total == 0)
-        {
-            // Zero-size dirs (placeholders): give children equal tiny slices so they remain visible.
-            double slice = Math.Max(parent.Sweep, 0.02) / kids.Count;
-            double a = parent.Angle0;
-            var equal = new List<SunburstNode>(kids.Count);
-            foreach (FsNode k in kids.TakeWhile(_ => true))
-            {
-                if (a >= parent.Angle1) break;
-                var n = new SunburstNode
-                {
-                    Source = k,
-                    Angle0 = a,
-                    Angle1 = Math.Min(a + slice, parent.Angle1),
-                    Depth = parent.Depth + 1,
-                };
-                equal.Add(n);
-                a += slice;
-            }
-            parent.Children = equal;
-            return;
-        }
-
-        double span = parent.Sweep;
-        var built = new List<SunburstNode>(kids.Count);
-        var small = new List<FsNode>();
+        // Zero-byte entries remain browsable in the list, but have no area to plot.
+        // Reserve one node for a smaller-items group; allocations never scale with child count.
+        int childBudget = Math.Min(MaxVisibleChildren, remainingNodes - 1);
+        var built = new List<SunburstNode>(Math.Min(kids.Count, childBudget));
         ulong smallBytes = 0;
+        int smallCount = 0;
         double cursor = parent.Angle0;
-
-        foreach (FsNode k in kids)
+        for (int i = 0; i < kids.Count; i++)
         {
-            double sweep = span * ((double)k.TotalAllocated / total);
-            if (sweep < minSweep && k != kids[0])
+            if ((i & 255) == 0) cancellationToken.ThrowIfCancellationRequested();
+            FsNode child = kids[i];
+            double sweep = parent.Sweep * ((double)child.TotalAllocated / src.TotalAllocated);
+            if (child.TotalAllocated == 0 || built.Count >= childBudget || (sweep < minSweep && i != 0))
             {
-                small.Add(k);
-                smallBytes += k.TotalAllocated;
+                smallCount++;
+                smallBytes = ulong.MaxValue - smallBytes < child.TotalAllocated
+                    ? ulong.MaxValue : smallBytes + child.TotalAllocated;
                 continue;
             }
-
             built.Add(new SunburstNode
             {
-                Source = k,
-                Angle0 = cursor,
-                Angle1 = cursor + sweep,
-                Depth = parent.Depth + 1,
+                Source = child, Angle0 = cursor, Angle1 = cursor + sweep, Depth = parent.Depth + 1,
             });
             cursor += sweep;
+            remainingNodes--;
         }
 
-        if (small.Count > 0 && cursor < parent.Angle1 - minSweep / 2)
+        double smallerSweep = parent.Sweep * ((double)smallBytes / src.TotalAllocated);
+        if (smallCount > 0 && smallerSweep > 0)
         {
             parent.AggregatedWedge = new SunburstNode
             {
-                Source = new FsNode
-                {
-                    Name = "smaller objects...",
-                    TotalAllocated = smallBytes,
-                    Flags = NodeFlags.Directory,
-                },
+                Source = new FsNode { Name = "smaller objects...", TotalAllocated = smallBytes, Flags = NodeFlags.Directory },
+                AggregateSource = src,
                 IsAggregatedWedge = true,
                 Angle0 = cursor,
-                Angle1 = parent.Angle1,
+                Angle1 = Math.Min(parent.Angle1, cursor + smallerSweep),
                 Depth = parent.Depth + 1,
             };
+            remainingNodes--;
         }
-        else if (built.Count > 0)
-        {
-            // Stretch the last node to close any rounding gap.
-            built[^1].Angle1 = parent.Angle1;
-        }
-
+        // Directory index allocation belongs to the parent, never its last child or aggregate.
         parent.Children = built;
         foreach (SunburstNode child in built)
-            LayoutChildren(child, minSweep, maxDepth);
+            LayoutChildren(child, minSweep, maxDepth, ref remainingNodes, cancellationToken);
     }
 
     private static void AssignBranches(SunburstNode root)

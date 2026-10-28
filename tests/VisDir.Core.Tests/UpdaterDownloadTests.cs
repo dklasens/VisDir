@@ -147,7 +147,7 @@ public class UpdaterDownloadPathTests
             File.WriteAllText(Path.Combine(installed, "VisDir.App.exe"), "unsigned");
             File.WriteAllText(Path.Combine(staged, "VisDir.App.exe"), "unsigned");
             File.WriteAllText(Path.Combine(staged, "VisDir.Scanner.dll"), "unsigned");
-            string script = UpdateService.UpdateScriptForTests;
+            string script = UpdateService.UpdateScriptForTests.Replace("\r\n", "\n");
             const string marker = "function Test-StagedSignatures";
             int start = script.IndexOf(marker, StringComparison.Ordinal);
             Assert.True(start >= 0, "Test-StagedSignatures not found in update script");
@@ -231,7 +231,7 @@ if (Test-AccessDenied $ex4) { throw 'Wrongly flagged FileNotFoundException' }
     }
 
     [Fact]
-    public void UpdateSwap_ExecutesFullDirectorySwapWithSubdirectories()
+    public void UpdateSwap_UpdatesLegacyPortableInstallWithoutRemovingUnownedFiles()
     {
         if (!OperatingSystem.IsWindows()) return;
         string tempRoot = Path.Combine(Path.GetTempPath(), "VisDir", "Updates");
@@ -250,9 +250,11 @@ if (Test-AccessDenied $ex4) { throw 'Wrongly flagged FileNotFoundException' }
             Directory.CreateDirectory(Path.Combine(staged, "runtimes"));
 
             File.WriteAllText(Path.Combine(appDir, "VisDir.App.exe"), "v1-app");
+            File.WriteAllText(Path.Combine(appDir, "personal-report.txt"), "keep me");
             File.WriteAllText(Path.Combine(staged, "VisDir.App.exe"), "v2-app");
             File.WriteAllText(Path.Combine(staged, "VisDir.Scanner.dll"), "v2-scanner");
             File.WriteAllText(Path.Combine(staged, "runtimes", "sub.dll"), "v2-sub");
+            WriteManifest(staged);
 
             string planJson = System.Text.Json.JsonSerializer.Serialize(new
             {
@@ -267,10 +269,12 @@ if (Test-AccessDenied $ex4) { throw 'Wrongly flagged FileNotFoundException' }
             File.WriteAllText(planPath, planJson);
 
             // Test execution of Invoke-UpdateSwap up to the swap (excluding starting the process)
-            string script = UpdateService.UpdateScriptForTests;
-            string harness = "$plan = Get-Content -LiteralPath '" + planPath.Replace("'", "''") + "' -Raw | ConvertFrom-Json\n"
+            string script = UpdateService.UpdateScriptForTests.Replace("\r\n", "\n");
+            int functionsStart = script.IndexOf("function Write-UpdateLog", StringComparison.Ordinal);
+            int functionsEnd = script.IndexOf("\ntry {\n    Invoke-UpdateSwap", StringComparison.Ordinal);
+            string harness = "$ErrorActionPreference = 'Stop'\n$plan = Get-Content -LiteralPath '" + planPath.Replace("'", "''") + "' -Raw | ConvertFrom-Json\n"
                 + "$PlanPath = '" + planPath.Replace("'", "''") + "'\n"
-                + script.Substring(script.IndexOf("function Test-AccessDenied", StringComparison.Ordinal))
+                + script.Substring(functionsStart, functionsEnd - functionsStart)
                 + "\nInvoke-UpdateSwap\n";
 
             // Replace the Start-Process line in harness with a mock that creates the marker
@@ -305,6 +309,8 @@ if (Test-AccessDenied $ex4) { throw 'Wrongly flagged FileNotFoundException' }
             Assert.Equal("v2-app", File.ReadAllText(Path.Combine(appDir, "VisDir.App.exe")));
             Assert.Equal("v2-scanner", File.ReadAllText(Path.Combine(appDir, "VisDir.Scanner.dll")));
             Assert.Equal("v2-sub", File.ReadAllText(Path.Combine(appDir, "runtimes", "sub.dll")));
+            Assert.Equal("keep me", File.ReadAllText(Path.Combine(appDir, "personal-report.txt")));
+            File.Delete(testPs1);
         }
         finally
         {
@@ -313,5 +319,13 @@ if (Test-AccessDenied $ex4) { throw 'Wrongly flagged FileNotFoundException' }
             try { File.Delete(planPath); } catch { }
             try { File.Delete(markerPath); } catch { }
         }
+    }
+
+    private static void WriteManifest(string directory)
+    {
+        string[] lines = Directory.GetFiles(directory, "*", SearchOption.AllDirectories)
+            .Select(path => $"{Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(File.ReadAllBytes(path)))}  {Path.GetRelativePath(directory, path)}")
+            .ToArray();
+        File.WriteAllLines(Path.Combine(directory, "checksums-win-x64.sha256"), lines);
     }
 }

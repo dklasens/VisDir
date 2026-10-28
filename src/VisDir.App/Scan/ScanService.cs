@@ -1,327 +1,334 @@
-using System.IO;
+﻿using System.ComponentModel;
 using System.Diagnostics;
-using System.Globalization;
-using System.Collections.Concurrent;
+using System.IO;
+using System.IO.Pipes;
+using System.Runtime.InteropServices;
+using System.Security.AccessControl;
 using System.Security.Principal;
+using System.Text;
+using System.Text.Json;
+using Microsoft.Win32.SafeHandles;
 using VisDir.Core;
-using VisDir.Core.Scanning;
+using VisDir.Scanner;
+
 namespace VisDir.App.Scan;
 
-/// <summary>
-/// Drives the elevated-capable scanner worker process and loads its binary snapshot.
-/// Progress arrives via stderr; the finished tree via a temp snapshot file.
-/// </summary>
+/// <summary>Owns one complete scan/load/publish session. Only the scanner broker may request elevation.</summary>
 public sealed class ScanService : IDisposable
 {
-    private Process? _process;
-    private CancellationTokenSource? _inProcessCts;
-    private Task? _inProcessTask;
-    private string? _tempFile;
-    private int _scanSequence;
-    private int _activeScanId;
-    private long _lastProgressReportMs; // 10Hz gate for PROGRESS notifications (Environment.TickCount64)
-    private readonly ConcurrentDictionary<int, byte> _cancelledScans = new();
+    private readonly object _gate = new();
+    private readonly Func<ScanOptions, string, CancellationToken, IProgress<ScanProgress>, Task<ScanResult>> _run;
+    private Session? _session;
+    private int _generation;
+    private bool _busy, _disposed;
 
-    public event Action<double>? ProgressChanged;          // 0..1 estimate
+    private sealed class Session(int id)
+    {
+        public int Id { get; } = id;
+        public CancellationTokenSource Cancellation { get; } = new();
+        public Stopwatch Clock { get; } = Stopwatch.StartNew();
+        public double LoadCompleteMs;
+        public long LastProgressMs;
+        public string LastProgressPhase = "";
+        public bool LastProgressWasDeterminate;
+        public Task? Work;
+        public bool ResultReady;
+        private int _disposed;
+        public void DisposeCancellation()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) == 0) Cancellation.Dispose();
+        }
+    }
+
+    public event Action<double>? ProgressChanged;
     public event Action<string>? StatusChanged;
     public event Action<ScanResult>? Completed;
     public event Action<string>? Failed;
     public event Action? Cancelled;
+    public event Action<ScanDisplayMetrics>? DisplayMeasured;
+    public static bool WorkerAvailable => !string.IsNullOrWhiteSpace(Environment.ProcessPath) && File.Exists(Environment.ProcessPath);
+    public int ScanId { get { lock (_gate) return _generation; } }
+    public bool IsScanning { get { lock (_gate) return _busy; } }
+    public bool IsCurrent(int id) { lock (_gate) return !_disposed && _generation == id; }
+    internal Task CurrentWork { get { lock (_gate) return _session?.Work ?? Task.CompletedTask; } }
 
-    public static bool WorkerAvailable =>
-        !string.IsNullOrWhiteSpace(Environment.ProcessPath) && File.Exists(Environment.ProcessPath);
+    public ScanService() : this(RunWorkerAsync) { }
+    internal ScanService(Func<ScanOptions, string, CancellationToken, IProgress<ScanProgress>, Task<ScanResult>> run) => _run = run;
 
-    public bool IsScanning => _process is { HasExited: false } || _inProcessTask is { IsCompleted: false };
     public void Start(string path, string mode = "auto")
     {
-        if (IsScanning) return;
-        // Elevated fast path: scan in-process via IDiskScanner, passing the result
-        // through memory instead of the child + temp snapshot roundtrip. The child
-        // path below stays for non-elevated callers and crash isolation.
-        if (IsElevated() && !string.Equals(mode, "generic", StringComparison.OrdinalIgnoreCase))
+        lock (_gate)
         {
-            StartInProcess(path, mode);
-            return;
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            if (_busy) return;
+            if (_session is { } previous) Retire(previous, cancel: false);
+            var session = new Session(++_generation);
+            _session = session;
+            _busy = true;
+            StatusChanged?.Invoke($"Scanning {path}…");
+            session.Work = Task.Run(() => RunAsync(session, path, mode));
         }
-        if (!WorkerAvailable)
-        {
-            Failed?.Invoke("The VisDir scanner worker is missing from the application directory.");
-            return;
-        }
+    }
 
-        _process?.Dispose();
-        int scanId = Interlocked.Increment(ref _scanSequence);
-        Volatile.Write(ref _activeScanId, scanId);
-        Interlocked.Exchange(ref _lastProgressReportMs, 0);
-
-        string exe = Environment.ProcessPath!;
-        string tempFile = Path.Combine(Path.GetTempPath(), $"visdir_{Guid.NewGuid():N}.vdir");
-        _tempFile = tempFile;
-
-        var psi = new ProcessStartInfo
-        {
-            FileName = exe,
-            CreateNoWindow = true,
-            UseShellExecute = false,
-            RedirectStandardError = true,
-            RedirectStandardOutput = true,
-        };
-        psi.ArgumentList.Add("--worker");
-        psi.ArgumentList.Add(path);
-        psi.ArgumentList.Add("--mode");
-        psi.ArgumentList.Add(mode);
-        psi.ArgumentList.Add("--out");
-        psi.ArgumentList.Add(tempFile);
-        psi.ArgumentList.Add("--top");
-        psi.ArgumentList.Add("0");
-
-        var sw = Stopwatch.StartNew();
+    private async Task RunAsync(Session session, string path, string mode)
+    {
+        bool awaitingPublication = false;
         try
         {
-            _process = Process.Start(psi);
+            var progress = new CallbackProgress(value =>
+            {
+                lock (_gate)
+                {
+                    if (_disposed || _generation != session.Id || session.Cancellation.IsCancellationRequested) return;
+                    long now = Environment.TickCount64;
+                    bool determinate = double.IsFinite(value.Fraction) && value.Fraction is >= 0 and <= 1;
+                    bool phaseChanged = !string.Equals(session.LastProgressPhase, value.Phase, StringComparison.Ordinal);
+                    if (!phaseChanged && determinate == session.LastProgressWasDeterminate && value.Fraction != 1 &&
+                        now - session.LastProgressMs < 100) return;
+                    session.LastProgressMs = now;
+                    session.LastProgressPhase = value.Phase;
+                    session.LastProgressWasDeterminate = determinate;
+                    ProgressChanged?.Invoke(value.Fraction);
+                    string phase = value.Phase == "Loading results" && determinate
+                        ? $"Loading results ({value.Fraction:P0})" : value.Phase;
+                    StatusChanged?.Invoke(value.FilesSeen == 0 && value.DirsSeen == 0 ? phase
+                        : $"{phase} · {value.FilesSeen:N0} files · {value.DirsSeen:N0} folders");
+                }
+            });
+            ScanResult result = await _run(new ScanOptions { Path = path }, mode, session.Cancellation.Token, progress).ConfigureAwait(false);
+            lock (_gate)
+            {
+                if (_disposed || _generation != session.Id || session.Cancellation.IsCancellationRequested) return;
+                session.LoadCompleteMs = session.Clock.Elapsed.TotalMilliseconds;
+                session.ResultReady = true;
+                awaitingPublication = true;
+                StatusChanged?.Invoke("Building visualization…");
+                // Busy remains true through the UI's first layout; AcceptResult ends it.
+                Completed?.Invoke(result);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            lock (_gate)
+            {
+                if (_disposed || _generation != session.Id) return;
+                _busy = false;
+                _session = null;
+                awaitingPublication = false;
+                Cancelled?.Invoke();
+            }
         }
         catch (Exception ex)
         {
-            Volatile.Write(ref _activeScanId, 0);
-            TryDeleteTempFile(tempFile);
-            Failed?.Invoke($"Failed to launch scanner: {ex.Message}");
-            return;
-        }
-        if (_process is null)
-        {
-            Volatile.Write(ref _activeScanId, 0);
-            TryDeleteTempFile(tempFile);
-            Failed?.Invoke("Scanner failed to start.");
-            return;
-        }
-
-        StatusChanged?.Invoke($"Scanning {path}…");
-
-        Process process = _process;
-        string? workerError = null;
-        process.ErrorDataReceived += (_, e) =>
-        {
-            if (e.Data is null) return;
-            if (e.Data.StartsWith("ERROR:", StringComparison.Ordinal))
-                Interlocked.Exchange(ref workerError, e.Data[6..].Trim());
-            if (e.Data.StartsWith("PROGRESS ", StringComparison.Ordinal))
+            lock (_gate)
             {
-                Dictionary<string, string> values = ParseValues(e.Data);
-                // Coalesce to 10Hz at the source; the UI also coalesces, and DONE always flushes.
-                long now = Environment.TickCount64;
-                if (now - Interlocked.Read(ref _lastProgressReportMs) < 100) return;
-                Interlocked.Exchange(ref _lastProgressReportMs, now);
-                double fraction = ParseDouble(values, "fraction", -1);
-                ProgressChanged?.Invoke(fraction);
-                long files = ParseLong(values, "files");
-                long dirs = ParseLong(values, "dirs");
-                string phase = values.TryGetValue("phase", out string? encoded)
-                    ? Uri.UnescapeDataString(encoded)
-                    : "Scanning";
-                StatusChanged?.Invoke($"{phase} · {files:N0} files · {dirs:N0} folders");
-            }
-            else if (e.Data.StartsWith("ENGINE ", StringComparison.Ordinal))
-            {
-                Dictionary<string, string> values = ParseValues(e.Data);
-                string engine = values.GetValueOrDefault("selected", "scanner");
-                string reason = Uri.UnescapeDataString(values.GetValueOrDefault("reason", ""));
-                StatusChanged?.Invoke($"{reason} ({engine})");
-            }
-            else if (e.Data.StartsWith("DONE ", StringComparison.Ordinal))
-            {
-                StatusChanged?.Invoke($"Building visualization · {sw.Elapsed.TotalSeconds:0.0}s scan");
-                ProgressChanged?.Invoke(0.99);
-            }
-        };
-
-        process.Exited += (_, _) =>
-        {
-            try
-            {
-                bool wasCancelled = _cancelledScans.ContainsKey(scanId);
-                if (!wasCancelled && process.ExitCode == 0 && File.Exists(tempFile))
-                {
-                    using var fs = new FileStream(tempFile, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 18,
-                        FileOptions.DeleteOnClose);
-                    // Worker already finalized totals and sort order; reuse stored aggregates.
-                    ScanResult result = TreeSerializer.Read(fs, recomputeTotals: false);
-                    Completed?.Invoke(result);
-                }
-                else if (wasCancelled)
-                {
-                    // Deliberate cancellation: a calm, expected outcome — not an error.
-                    Cancelled?.Invoke();
-                }
-                else
-                {
-                    string? detail = Volatile.Read(ref workerError);
-                    Failed?.Invoke(string.IsNullOrWhiteSpace(detail)
-                        ? $"Scanner exited with code {process.ExitCode}."
-                        : $"Scanner failed: {detail}");
-                }
-            }
-            catch (Exception ex)
-            {
+                if (_disposed || _generation != session.Id) return;
+                _busy = false;
+                _session = null;
+                awaitingPublication = false;
                 Failed?.Invoke(ex.Message);
             }
-            finally
-            {
-                _cancelledScans.TryRemove(scanId, out _);
-                TryDeleteTempFile(tempFile);
-                if (Volatile.Read(ref _activeScanId) == scanId)
-                    Volatile.Write(ref _activeScanId, 0);
-            }
-        };
+        }
+        finally
+        {
+            if (!awaitingPublication) session.DisposeCancellation();
+        }
+    }
 
-        // Attach the handler before enabling events so an immediately-exiting worker cannot be missed.
-        process.EnableRaisingEvents = true;
-        process.BeginErrorReadLine();
-        process.BeginOutputReadLine();
+    public void AcceptResult(int id)
+    {
+        lock (_gate)
+        {
+            if (_disposed || _generation != id || _session is not { ResultReady: true } session) return;
+            _busy = false;
+            _session = null;
+            Retire(session, cancel: false);
+            using Process current = Process.GetCurrentProcess();
+            var metrics = new ScanDisplayMetrics(session.LoadCompleteMs,
+                Math.Max(0, session.Clock.Elapsed.TotalMilliseconds - session.LoadCompleteMs),
+                session.Clock.Elapsed.TotalMilliseconds, current.PeakWorkingSet64);
+            App.SafeLog($"[Scan] load={metrics.ScanAndLoadMs:F1}ms view={metrics.FirstViewMs:F1}ms usable={metrics.FirstUsableMs:F1}ms processPeak={metrics.ProcessPeakWorkingSetBytes}");
+            DisplayMeasured?.Invoke(metrics);
+        }
     }
 
     public void Cancel()
     {
-        int scanId = Volatile.Read(ref _activeScanId);
-        if (scanId != 0) _cancelledScans.TryAdd(scanId, 0);
-        try { if (_process is { HasExited: false } p) p.Kill(entireProcessTree: true); }
-        catch { /* best effort */ }
-        try { _inProcessCts?.Cancel(); }
-        catch { /* best effort */ }
+        Session? old;
+        lock (_gate)
+        {
+            old = _session;
+            bool wasBusy = _busy;
+            _session = null;
+            _busy = false;
+            ++_generation;
+            if (wasBusy && !_disposed) Cancelled?.Invoke();
+        }
+        if (old is not null) Retire(old, cancel: true);
     }
 
-    private void StartInProcess(string path, string mode)
+    private static void Retire(Session session, bool cancel)
     {
-        _process?.Dispose();
-        _process = null;
-        int scanId = Interlocked.Increment(ref _scanSequence);
-        Volatile.Write(ref _activeScanId, scanId);
-        Interlocked.Exchange(ref _lastProgressReportMs, 0);
-
-        var cts = new CancellationTokenSource();
-        _inProcessCts?.Dispose();
-        _inProcessCts = cts;
-        StatusChanged?.Invoke($"Scanning {path}…");
-
-        var progress = new InlineScanProgress(p =>
+        if (cancel)
         {
-            long now = Environment.TickCount64;
-            if (now - Interlocked.Read(ref _lastProgressReportMs) < 100) return;
-            Interlocked.Exchange(ref _lastProgressReportMs, now);
-            ProgressChanged?.Invoke(p.Fraction);
-            StatusChanged?.Invoke($"{p.Phase} · {p.FilesSeen:N0} files · {p.DirsSeen:N0} folders");
-        });
-
-        var options = new ScanOptions { Path = path };
-        bool wantMft = !string.Equals(mode, "generic", StringComparison.OrdinalIgnoreCase)
-            && (string.Equals(mode, "mft", StringComparison.OrdinalIgnoreCase) || ShouldUseMft(path));
-        IDiskScanner primary = wantMft ? new NtfsMftScanner() : new GenericScanner();
-        string engine = wantMft ? "mft" : "generic";
-        StatusChanged?.Invoke($"{(wantMft ? "Fast NTFS scan selected" : "Compatible scan selected")} ({engine})");
-
-        CancellationToken token = cts.Token;
-        _inProcessTask = Task.Run(() =>
-        {
-            try
-            {
-                ScanResult result;
-                try
-                {
-                    result = primary.Scan(options, token, progress);
-                }
-                catch (OperationCanceledException)
-                {
-                    throw;
-                }
-                catch (Exception) when (wantMft)
-                {
-                    result = new GenericScanner().Scan(options, token, progress);
-                }
-                token.ThrowIfCancellationRequested();
-                if (_cancelledScans.ContainsKey(scanId)) Cancelled?.Invoke();
-                else Completed?.Invoke(result);
-            }
-            catch (OperationCanceledException)
-            {
-                Cancelled?.Invoke();
-            }
-            catch (Exception ex)
-            {
-                if (_cancelledScans.ContainsKey(scanId)) Cancelled?.Invoke();
-                else Failed?.Invoke(ex.Message);
-            }
-            finally
-            {
-                _cancelledScans.TryRemove(scanId, out _);
-                if (Volatile.Read(ref _activeScanId) == scanId)
-                    Volatile.Write(ref _activeScanId, 0);
-            }
-        }, CancellationToken.None);
-    }
-
-    private static bool ShouldUseMft(string path)
-    {
-        try
-        {
-            string root = PathUtils.NormalizeScanRoot(path);
-            if (root.Length != 3 || root[1] != ':' || !root.EndsWith("\\")) return false;
-            if (!Directory.Exists(root)) return false;
-            return string.Equals(VolumeQuery.Query(root).FileSystemName, "NTFS", StringComparison.OrdinalIgnoreCase);
+            try { session.Cancellation.Cancel(); }
+            catch (ObjectDisposedException) { }
         }
-        catch
-        {
-            return false;
-        }
-    }
-
-    private static bool IsElevated()
-    {
-        try
-        {
-            using var identity = WindowsIdentity.GetCurrent();
-            return new WindowsPrincipal(identity).IsInRole(WindowsBuiltInRole.Administrator);
-        }
-        catch
-        {
-            return false;
-        }
-    }
-
-    private sealed class InlineScanProgress(Action<ScanProgress> callback) : IProgress<ScanProgress>
-    {
-        public void Report(ScanProgress value) => callback(value);
+        _ = (session.Work ?? Task.CompletedTask).ContinueWith(_ => session.DisposeCancellation(),
+            CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
     }
 
     public void Dispose()
     {
+        lock (_gate) _disposed = true;
         Cancel();
-        try { if (_tempFile is not null && File.Exists(_tempFile)) File.Delete(_tempFile); }
-        catch { /* ignore */ }
-        _process?.Dispose();
-        _inProcessCts?.Dispose();
     }
 
-    private static Dictionary<string, string> ParseValues(string line)
+    private static Task<ScanResult> RunWorkerAsync(ScanOptions options, string mode,
+        CancellationToken token, IProgress<ScanProgress> progress)
+        => RunWorkerAsync(options, mode, token, progress, Environment.ProcessPath!);
+
+    internal static NamedPipeServerStream CreateWorkerPipe(string pipeName)
     {
-        var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        foreach (string token in line.Split(' ', StringSplitOptions.RemoveEmptyEntries).Skip(1))
+        // CurrentUserOnly also compares integrity/elevation on Windows, which rejects
+        // our elevated child. The protected SID ACL admits this user at either level.
+        using WindowsIdentity identity = WindowsIdentity.GetCurrent();
+        var sid = identity.User ?? throw new IOException("The current user has no Windows identity.");
+        var security = new PipeSecurity();
+        security.SetAccessRuleProtection(isProtected: true, preserveInheritance: false);
+        security.SetOwner(sid);
+        security.AddAccessRule(new PipeAccessRule(sid, PipeAccessRights.FullControl, AccessControlType.Allow));
+        return NamedPipeServerStreamAcl.Create(pipeName, PipeDirection.InOut, 1, PipeTransmissionMode.Byte,
+            PipeOptions.Asynchronous | PipeOptions.FirstPipeInstance, 64 * 1024, 64 * 1024, security);
+    }
+
+    internal static async Task<ScanResult> RunWorkerAsync(ScanOptions options, string mode,
+        CancellationToken token, IProgress<ScanProgress> progress, string executablePath,
+        TimeSpan? connectionTimeout = null, Action<int>? workerStarted = null)
+    {
+        token.ThrowIfCancellationRequested();
+        if (string.IsNullOrWhiteSpace(executablePath) || !File.Exists(executablePath)) throw new IOException("The scanner executable is unavailable.");
+        var transportClock = Stopwatch.StartNew();
+        string pipeName = "visdir-" + Guid.NewGuid().ToString("N");
+        using var pipe = CreateWorkerPipe(pipeName);
+        bool elevate = new ScanCoordinator().ShouldRequestElevation(mode, options.Path);
+        var start = new ProcessStartInfo
         {
-            int equals = token.IndexOf('=');
-            if (equals > 0) result[token[..equals]] = token[(equals + 1)..];
+            FileName = executablePath, UseShellExecute = elevate, CreateNoWindow = !elevate,
+            WindowStyle = ProcessWindowStyle.Hidden,
+        };
+        if (elevate) start.Verb = "runas";
+        start.ArgumentList.Add("--worker-pipe");
+        start.ArgumentList.Add(pipeName);
+        start.ArgumentList.Add(Environment.ProcessId.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        Process? worker;
+        try { worker = Process.Start(start); }
+        catch (Win32Exception ex) when (ex.NativeErrorCode == 1223) { throw new OperationCanceledException("Administrator scan cancelled.", ex, token); }
+        using (worker)
+        {
+            if (worker is null) throw new IOException("The scanner could not be started.");
+            workerStarted?.Invoke(worker.Id);
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(token);
+            if (connectionTimeout == TimeSpan.Zero) timeout.Cancel();
+            else timeout.CancelAfter(connectionTimeout ?? TimeSpan.FromMinutes(2));
+            using var registration = token.Register(() =>
+            {
+                try { pipe.Dispose(); } catch { }
+                try { if (!worker.HasExited) worker.Kill(entireProcessTree: true); } catch { }
+            });
+            try
+            {
+                Task exited = worker.WaitForExitAsync();
+                while (true)
+                {
+                    Task connection = pipe.WaitForConnectionAsync(timeout.Token);
+                    if (await Task.WhenAny(connection, exited).ConfigureAwait(false) == exited && !pipe.IsConnected)
+                        throw new IOException($"Scanner exited before connecting (code {worker.ExitCode}).");
+                    await connection.ConfigureAwait(false);
+                    if (GetNamedPipeClientProcessId(pipe.SafePipeHandle, out uint clientPid) && clientPid == worker.Id) break;
+                    pipe.Disconnect();
+                }
+                timeout.CancelAfter(Timeout.InfiniteTimeSpan);
+                double startupMs = transportClock.Elapsed.TotalMilliseconds;
+                using var writer = new BinaryWriter(pipe, Encoding.UTF8, leaveOpen: true);
+                writer.Write(JsonSerializer.Serialize(new WorkerRequest(options.Path, mode, options.Threads)));
+                writer.Flush();
+                return ReadWorkerResponse(pipe, token, progress, startupMs);
+            }
+            catch (Exception) when (token.IsCancellationRequested) { throw new OperationCanceledException(token); }
+            catch (OperationCanceledException) when (timeout.IsCancellationRequested)
+            { throw new TimeoutException("The scanner did not connect in time."); }
+            finally
+            {
+                // Closing the authenticated session cancels an elevated helper even when Kill is denied.
+                pipe.Dispose();
+                try
+                {
+                    if (!worker.HasExited)
+                    {
+                        try { worker.Kill(entireProcessTree: true); } catch (Win32Exception) { }
+                        await worker.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(3)).ConfigureAwait(false);
+                    }
+                }
+                catch (Exception ex) when (ex is Win32Exception or InvalidOperationException or TimeoutException) { }
+            }
         }
-        return result;
     }
 
-    private static long ParseLong(IReadOnlyDictionary<string, string> values, string key) =>
-        values.TryGetValue(key, out string? raw) && long.TryParse(raw, NumberStyles.Integer, CultureInfo.InvariantCulture, out long value)
-            ? value : 0;
-
-    private static double ParseDouble(IReadOnlyDictionary<string, string> values, string key, double fallback) =>
-        values.TryGetValue(key, out string? raw) && double.TryParse(raw, NumberStyles.Float, CultureInfo.InvariantCulture, out double value)
-            ? value : fallback;
-
-    private static void TryDeleteTempFile(string path)
+    /// <summary>Reads one complete worker response without closing the caller's stream.</summary>
+    internal static ScanResult ReadWorkerResponse(Stream stream, CancellationToken token,
+        IProgress<ScanProgress> progress, double startupMs)
     {
-        try { if (File.Exists(path)) File.Delete(path); }
-        catch { /* best effort */ }
+        // Buffer from the first marker onward. Replacing a buffer after the Result marker
+        // would discard snapshot bytes that were read ahead with earlier messages.
+        // BufferedStream has no leaveOpen option; only its reader is disposed here.
+        var buffered = new BufferedStream(stream, 1 << 18);
+        using var reader = new BinaryReader(buffered, Encoding.UTF8, leaveOpen: true);
+        ScanProgress? lastProgress = null;
+        while (true)
+        {
+            token.ThrowIfCancellationRequested();
+            byte kind = reader.ReadByte();
+            if (kind == WorkerHost.Progress)
+            {
+                ScanProgress? value = JsonSerializer.Deserialize<ScanProgress>(reader.ReadString());
+                if (value is not null)
+                {
+                    lastProgress = value;
+                    progress.Report(value);
+                }
+            }
+            else if (kind == WorkerHost.Result)
+            {
+                if (lastProgress is { } previous && (previous.FilesSeen > 0 || previous.DirsSeen > 0))
+                    progress.Report(previous with { Fraction = -1, Phase = "Loading results" });
+                var loadingClock = Stopwatch.StartNew();
+                ScanResult result = TreeSerializer.Read(buffered, recomputeTotals: false, token, progress);
+                var phases = new Dictionary<string, double>(result.Stats.PhaseMs)
+                {
+                    ["broker-startup"] = startupMs,
+                    ["snapshot-load"] = loadingClock.Elapsed.TotalMilliseconds,
+                };
+                return new ScanResult
+                {
+                    Root = result.Root, Volume = result.Volume, EngineName = result.EngineName,
+                    RequestedEngine = result.RequestedEngine, FallbackReason = result.FallbackReason,
+                    Completeness = result.Completeness, Issues = result.Issues, AccountingFeatures = result.AccountingFeatures,
+                    Stats = result.Stats with { PhaseMs = new System.Collections.ObjectModel.ReadOnlyDictionary<string, double>(phases) },
+                };
+            }
+            else if (kind == WorkerHost.Error) throw new IOException(reader.ReadString());
+            else if (kind == WorkerHost.Cancelled) throw new OperationCanceledException(token);
+            else throw new InvalidDataException("Unknown scanner message.");
+        }
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetNamedPipeClientProcessId(SafePipeHandle pipe, out uint clientProcessId);
+    private sealed class CallbackProgress(Action<ScanProgress> callback) : IProgress<ScanProgress>
+    {
+        public void Report(ScanProgress value) => callback(value);
     }
 }
+
+public sealed record ScanDisplayMetrics(double ScanAndLoadMs, double FirstViewMs, double FirstUsableMs, long ProcessPeakWorkingSetBytes);

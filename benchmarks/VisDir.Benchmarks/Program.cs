@@ -1,6 +1,10 @@
 using System.Diagnostics;
+using System.IO;
 using VisDir.Core;
 using VisDir.Core.Scanning;
+using VisDir.App;
+using VisDir.App.Sunburst;
+using System.Text.Json;
 
 namespace VisDir.Benchmarks;
 
@@ -10,7 +14,8 @@ internal static class Program
     {
         if (TryArgument(args, "--mftimage", out string? imagePath)) return RunMftBench(imagePath, args);
         if (HasFlag(args, "--mftbench")) return RunMftBench(null, args);
-        if (TryArgument(args, "--scan", out string? scanPath)) return RunScan(scanPath!);
+        if (TryArgument(args, "--scan", out string? scanPath)) return RunPipeline(scanPath, args);
+        if (HasFlag(args, "--pipeline")) return RunPipeline(null, args);
         int nodes = TryArgument(args, "--nodes", out string? raw) && int.TryParse(raw, out int parsed)
             ? Math.Clamp(parsed, 1_000, 5_000_000)
             : 250_000;
@@ -73,7 +78,8 @@ internal static class Program
             {
                 parent.AddChild(new FsNode
                 {
-                    Name = $"file-{i}.bin", LogicalSize = (ulong)(i % 1_000_000),
+                    Name = $"file-{i}.bin",
+                    LogicalSize = (ulong)(i % 1_000_000),
                     AllocatedSize = (ulong)((i % 256) + 1) * 4096,
                 });
             }
@@ -191,7 +197,7 @@ internal static class Program
         phaseClock.Stop();
         Print("serialize", 20_000, phaseClock.Elapsed, phaseStream.Length);
         Console.WriteLine($"build   entries={buildSink.Count:N0} (dictionary inserts inside parse timing above)");
-        Console.WriteLine($"native-parser gate: parse share {parseShare:N1}% vs 30% threshold -> {(parseShare > 30 ? "GO (profile further)" : "NO-GO")}");
+        Console.WriteLine("Synthetic memcpy is not disk I/O. Choose parser changes from real end-to-end profiles, not this percentage alone.");
         return 0;
     }
 
@@ -319,16 +325,89 @@ internal static class Program
     private static bool HasFlag(string[] args, string name)
         => Array.Exists(args, a => string.Equals(a, name, StringComparison.OrdinalIgnoreCase));
 
-    private static int RunScan(string path)
+    private static int RunPipeline(string? path, string[] args)
     {
-        path = Path.GetFullPath(path);
-        Console.WriteLine($"VisDir compatible scanner benchmark · {path}");
-        var progress = new InlineProgress<ScanProgress>(p =>
-            Console.Write($"\r{p.FilesSeen:N0} files · {p.DirsSeen:N0} folders · {p.ElapsedMs / 1000:0.0}s"));
-        ScanResult result = new GenericScanner().Scan(
-            new ScanOptions { Path = path }, CancellationToken.None, progress);
-        Console.WriteLine();
-        Console.WriteLine($"{result.Stats.FileCount:N0} files · {SizeFormatter.Format(result.Root.TotalAllocated)} · {result.Stats.ElapsedMs / 1000:0.000}s");
+        string mode = TryArgument(args, "--mode", out string? value) ? value! : "auto";
+        int threads = IntArgument(args, "--threads", 0, 0, 64);
+        int iterations = IntArgument(args, "--iters", 3, 1, 20);
+        int nodes = IntArgument(args, "--nodes", 250_000, 1_000, 5_000_000);
+        var measurements = new List<object>();
+        Console.WriteLine(path is null ? $"Synthetic view pipeline · {nodes:N0} nodes" : $"Scan pipeline · {Path.GetFullPath(path)} · {mode} · threads={threads}");
+        for (int iteration = 0; iteration < iterations; iteration++)
+        {
+            long allocatedBefore = GC.GetTotalAllocatedBytes(true);
+            var total = Stopwatch.StartNew();
+            ScanResult result;
+            if (path is null)
+            {
+                FsNode root = BuildTree(nodes);
+                TreeOps.Finalize(root);
+                TreeOps.Freeze(root);
+                result = new ScanResult
+                {
+                    Root = root,
+                    EngineName = "synthetic",
+                    Volume = new VolumeInfo { RootPath = "C:\\", DisplayName = "Synthetic" },
+                    Stats = new ScanStats(),
+                };
+            }
+            else result = new ScanCoordinator().Run(new ScanOptions { Path = Path.GetFullPath(path), Threads = threads }, mode, default, null);
+            double scanMs = total.Elapsed.TotalMilliseconds;
+            var phase = Stopwatch.StartNew();
+            using var snapshot = new MemoryStream();
+            TreeSerializer.Write(snapshot, result);
+            double serializeMs = phase.Elapsed.TotalMilliseconds;
+            snapshot.Position = 0;
+            phase.Restart();
+            ScanResult loaded = TreeSerializer.Read(snapshot, recomputeTotals: false);
+            double loadMs = phase.Elapsed.TotalMilliseconds;
+            phase.Restart();
+            SunburstNode layout = SunburstLayout.Build(loaded.Root);
+            DirectoryPage page = DirectoryViewModel.Build(loaded.Root, "", false, 0);
+            double initialViewMs = phase.Elapsed.TotalMilliseconds;
+            double pipelineMs = total.Elapsed.TotalMilliseconds;
+
+            var navigation = new List<double>();
+            var pending = new Queue<FsNode>();
+            pending.Enqueue(loaded.Root);
+            while (pending.Count > 0 && navigation.Count < 100)
+            {
+                FsNode directory = pending.Dequeue();
+                if (directory.Children is not { Count: > 0 } children) continue;
+                phase.Restart();
+                SunburstLayout.Build(directory);
+                DirectoryViewModel.Build(directory, "", true, 0);
+                navigation.Add(phase.Elapsed.TotalMilliseconds);
+                foreach (FsNode child in children)
+                    if (child.IsDirectory && pending.Count < 100) pending.Enqueue(child);
+            }
+            navigation.Sort();
+            double p95 = navigation.Count == 0 ? 0 : navigation[(int)Math.Ceiling(navigation.Count * 0.95) - 1];
+            long allocated = GC.GetTotalAllocatedBytes(true) - allocatedBefore;
+            using Process process = Process.GetCurrentProcess();
+            measurements.Add(new
+            {
+                iteration = iteration + 1,
+                result.EngineName,
+                result.Completeness,
+                result.FallbackReason,
+                scanMs,
+                serializeMs,
+                loadMs,
+                initialViewMs,
+                pipelineMs,
+                navigationP95Ms = p95,
+                snapshotBytes = snapshot.Length,
+                managedAllocatedBytes = allocated,
+                processPeakWorkingSetBytes = process.PeakWorkingSet64,
+                phases = result.Stats.PhaseMs,
+            });
+            Console.WriteLine($"#{iteration + 1}: scan={scanMs:F1}ms serialize={serializeMs:F1}ms load={loadMs:F1}ms view={initialViewMs:F1}ms pipeline={pipelineMs:F1}ms navigation-p95={p95:F2}ms allocated={SizeFormatter.Format((ulong)allocated)}");
+            GC.KeepAlive(layout); GC.KeepAlive(page);
+        }
+        Console.WriteLine("Pipeline times include in-memory snapshot transfer and view models; actual first usable UI and process peak are logged by the app. Iterations do not clear filesystem caches.");
+        if (TryArgument(args, "--json", out string? output))
+            File.WriteAllText(Path.GetFullPath(output!), JsonSerializer.Serialize(measurements, new JsonSerializerOptions { WriteIndented = true }));
         return 0;
     }
 

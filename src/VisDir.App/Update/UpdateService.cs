@@ -813,6 +813,57 @@ function Move-ItemWithRetry([string] $Path, [string] $Destination) {
         }
     }
 }
+function Get-OwnedFiles([string] $Root, [bool] $Verify) {
+    $prefix = [System.IO.Path]::GetFullPath($Root).TrimEnd('\', '/') + '\'
+    $owned = New-Object 'System.Collections.Generic.Dictionary[string,string]' ([StringComparer]::OrdinalIgnoreCase)
+    $manifests = @(Get-ChildItem -LiteralPath $Root -Filter 'checksums-*.sha256' -File |
+        Where-Object { $_.Name -in @('checksums-win-x64.sha256', 'checksums-win-arm64.sha256') })
+    if ($Verify -and $manifests.Count -eq 0) { throw 'The update has no ownership manifest.' }
+    foreach ($manifest in $manifests) {
+        foreach ($line in [System.IO.File]::ReadAllLines($manifest.FullName)) {
+            if ([string]::IsNullOrWhiteSpace($line) -or $line.TrimStart().StartsWith('#')) { continue }
+            if ($line -notmatch '^([0-9a-fA-F]{64})\s+\*?(.+)$') { throw 'Invalid update ownership manifest.' }
+            $hash = $Matches[1]
+            $relative = $Matches[2].Replace('/', '\')
+            if ([System.IO.Path]::IsPathRooted($relative) -or $relative.Contains(':') -or
+                ($relative -split '\\' -contains '..')) { throw 'Unsafe update ownership path.' }
+            $full = [System.IO.Path]::GetFullPath((Join-Path $Root $relative))
+            if (-not $full.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) { throw 'Update ownership path escapes installation.' }
+            $relative = $full.Substring($prefix.Length)
+            if ($owned.ContainsKey($relative)) { throw 'Duplicate update ownership path.' }
+            if ($Verify -and (-not [System.IO.File]::Exists($full) -or
+                (Get-FileHash -LiteralPath $full -Algorithm SHA256).Hash -ne $hash)) { throw "Update checksum failed: $relative" }
+            $owned.Add($relative, $hash)
+        }
+        $owned[$manifest.Name] = ''
+    }
+    if ($manifests.Count -gt 0 -and (-not $owned.ContainsKey('VisDir.App.exe') -or -not $owned.ContainsKey('VisDir.Scanner.dll'))) {
+        throw 'The update manifest does not own the required application files.'
+    }
+    return ,$owned
+}
+function Test-InstallPath([string] $Root, [string] $Relative) {
+    $prefix = [System.IO.Path]::GetFullPath($Root).TrimEnd('\', '/') + '\'
+    $path = [System.IO.Path]::GetFullPath((Join-Path $Root $Relative))
+    if (-not $path.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) { throw 'Update destination escapes installation.' }
+    for ($current = $path; $current.Length -ge $prefix.Length; $current = [System.IO.Path]::GetDirectoryName($current)) {
+        if (Test-Path -LiteralPath $current) {
+            if ((Get-Item -LiteralPath $current -Force).Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+                throw "Update destination contains a reparse point: $Relative"
+            }
+        }
+    }
+    return $path
+}
+function Restore-UpdatedFiles([string] $Root, [string] $Backup, $Changed) {
+    for ($i = $Changed.Count - 1; $i -ge 0; $i--) {
+        $relative = $Changed[$i]
+        $target = Test-InstallPath $Root $relative
+        if ([System.IO.File]::Exists($target)) { Remove-Item -LiteralPath $target -Force }
+        $original = Join-Path $Backup $relative
+        if ([System.IO.File]::Exists($original)) { Move-ItemWithRetry -Path $original -Destination $target }
+    }
+}
 function Invoke-UpdateSwap {
     Test-UpdatePlan
     Test-StagedSignatures ([System.IO.Path]::GetFullPath([string]$plan.StagedDir))
@@ -821,54 +872,84 @@ function Invoke-UpdateSwap {
 
     $appDir = [System.IO.Path]::GetFullPath([string]$plan.AppDir).TrimEnd('\', '/')
     $stagedDir = [System.IO.Path]::GetFullPath([string]$plan.StagedDir).TrimEnd('\', '/')
-    $parent = Split-Path -Parent $appDir
-    $leaf = Split-Path -Leaf $appDir
-    $candidate = Join-Path $parent ($leaf + '.candidate-' + $plan.OperationId)
-    $backup = Join-Path $parent ($leaf + '.previous')
-
-    if (Test-Path -LiteralPath $candidate) { Remove-Item -LiteralPath $candidate -Recurse -Force }
-    New-Item -ItemType Directory -Path $candidate -Force | Out-Null
-    Copy-Item -Path (Join-Path $stagedDir '*') -Destination $candidate -Recurse -Force
-    if (-not (Test-Path -LiteralPath (Join-Path $candidate $plan.RelativeExe))) {
-        throw 'Candidate installation is missing the application executable.'
+    if ([string]$plan.OperationId -notmatch '^[0-9a-fA-F]{32}$') { throw 'Invalid update operation identifier.' }
+    $backup = Test-InstallPath $appDir ('.visdir-update-' + $plan.OperationId)
+    if (Test-Path -LiteralPath $backup) { throw 'An update backup already exists; refusing to overwrite it.' }
+    $payload = Get-OwnedFiles $stagedDir $true
+    # Old releases without a manifest remain supported: retain every unowned file.
+    # A malformed old manifest never authorizes deleting an installed file.
+    try { $previous = Get-OwnedFiles $appDir $false }
+    catch { $previous = New-Object 'System.Collections.Generic.Dictionary[string,string]' ([StringComparer]::OrdinalIgnoreCase) }
+    $remove = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($relative in $previous.Keys) {
+        if ($payload.ContainsKey($relative)) { continue }
+        $target = Test-InstallPath $appDir $relative
+        if ([System.IO.File]::Exists($target) -and $previous[$relative] -ne '' -and
+            (Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash -eq $previous[$relative]) { $remove.Add($relative) }
     }
-    Test-StagedSignatures $candidate
-
-    if (Test-Path -LiteralPath $backup) { Remove-Item -LiteralPath $backup -Recurse -Force }
-    $movedOld = $false
+    $preserveBackup = $false
+    foreach ($relative in $payload.Keys) {
+        $target = Test-InstallPath $appDir $relative
+        if ([System.IO.Directory]::Exists($target)) { throw "Update file conflicts with an existing directory: $relative" }
+        if ([System.IO.File]::Exists($target) -and
+            (-not $previous.ContainsKey($relative) -or
+             ($previous[$relative] -ne '' -and (Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash -ne $previous[$relative]))) {
+            # A legacy file or a locally edited owned file may contain user data.
+            # Keep its original bytes recoverable even when the new release needs its path.
+            $preserveBackup = $true
+        }
+    }
+    [System.IO.Directory]::CreateDirectory($backup) | Out-Null
+    $changed = New-Object 'System.Collections.Generic.List[string]'
     try {
-        Move-ItemWithRetry -Path $appDir -Destination $backup
-        $movedOld = $true
-        Move-ItemWithRetry -Path $candidate -Destination $appDir
+        # Only payload-owned paths are replaced. Reports, settings and unrelated
+        # portable applications stay in place, even in a shared installation folder.
+        foreach ($relative in @($payload.Keys) + @($remove)) {
+            $target = Test-InstallPath $appDir $relative
+            $saved = Join-Path $backup $relative
+            if ([System.IO.File]::Exists($target)) {
+                [System.IO.Directory]::CreateDirectory([System.IO.Path]::GetDirectoryName($saved)) | Out-Null
+                Move-ItemWithRetry -Path $target -Destination $saved
+            }
+            $changed.Add($relative)
+            if ($payload.ContainsKey($relative)) {
+                [System.IO.Directory]::CreateDirectory([System.IO.Path]::GetDirectoryName($target)) | Out-Null
+                [System.IO.File]::Copy((Join-Path $stagedDir $relative), $target, $false)
+            }
+        }
+        Remove-Item -LiteralPath $plan.MarkerPath -Force -ErrorAction SilentlyContinue
+        $env:VISDIR_UPDATE_HEALTH_MARKER = [string]$plan.MarkerPath
+        $newProcess = Start-Process -FilePath (Join-Path $appDir $plan.RelativeExe) -PassThru
+        $healthy = $false
+        for ($i = 0; $i -lt 300; $i++) {
+            if (Test-Path -LiteralPath $plan.MarkerPath) { $healthy = $true; break }
+            if ($newProcess.HasExited) { break }
+            Start-Sleep -Milliseconds 100
+        }
+        if (-not $healthy) {
+            if (-not $newProcess.HasExited) { Stop-Process -Id $newProcess.Id -Force -ErrorAction SilentlyContinue }
+            throw 'The updated application did not report a healthy startup.'
+        }
     } catch {
-        if ($movedOld -and (Test-Path -LiteralPath $backup)) {
-            if (Test-Path -LiteralPath $appDir) { Remove-Item -LiteralPath $appDir -Recurse -Force }
-            Move-ItemWithRetry -Path $backup -Destination $appDir
+        try {
+            Restore-UpdatedFiles $appDir $backup $changed
+            Remove-Item -LiteralPath $backup -Recurse -Force
+        } catch {
+            Write-UpdateLog ("Rollback needs recovery from {0}: {1}" -f $backup, $_.Exception.Message)
+            throw
         }
         throw
     }
-
     Remove-Item -LiteralPath $plan.MarkerPath -Force -ErrorAction SilentlyContinue
-    $env:VISDIR_UPDATE_HEALTH_MARKER = [string]$plan.MarkerPath
-    $newProcess = Start-Process -FilePath (Join-Path $appDir $plan.RelativeExe) -PassThru
-    $healthy = $false
-    for ($i = 0; $i -lt 300; $i++) {
-        if (Test-Path -LiteralPath $plan.MarkerPath) { $healthy = $true; break }
-        if ($newProcess.HasExited) { break }
-        Start-Sleep -Milliseconds 100
+    if ($preserveBackup) {
+        $preserved = Test-InstallPath $appDir ('.visdir-preserved-' + $plan.OperationId)
+        try {
+            Move-ItemWithRetry -Path $backup -Destination $preserved
+            Write-UpdateLog ("Original locally changed or previously unowned files were preserved in {0}." -f $preserved)
+        } catch { Write-UpdateLog ("Original files remain preserved in {0}." -f $backup) }
+    } else {
+        Remove-Item -LiteralPath $backup -Recurse -Force -ErrorAction SilentlyContinue
     }
-    if (-not $healthy) {
-        Write-UpdateLog 'New version failed startup health check; rolling back.'
-        if (-not $newProcess.HasExited) { Stop-Process -Id $newProcess.Id -Force -ErrorAction SilentlyContinue }
-        $failed = $appDir + '.failed-' + $plan.OperationId
-        if (Test-Path -LiteralPath $failed) { Remove-Item -LiteralPath $failed -Recurse -Force }
-        Move-ItemWithRetry -Path $appDir -Destination $failed
-        Move-ItemWithRetry -Path $backup -Destination $appDir
-        Start-InstalledApp $appDir
-        throw 'The updated application did not report a healthy startup.'
-    }
-    Remove-Item -LiteralPath $plan.MarkerPath -Force -ErrorAction SilentlyContinue
-    Remove-Item -LiteralPath $backup -Recurse -Force -ErrorAction SilentlyContinue
     Write-UpdateLog 'Update completed and passed startup health check.'
 }
 

@@ -15,11 +15,47 @@ public partial class App : Application
     {
         VisDir.Core.Interop.TokenPrivilegeManager.TryEnableBackupPrivileges();
 
+        if (e.Args is ["--worker-pipe", var pipeName, var parentId])
+        {
+            ShutdownMode = ShutdownMode.OnExplicitShutdown;
+            Shutdown(int.TryParse(parentId, out int processId) ? WorkerHost.Execute(pipeName, processId) : 1);
+            return;
+        }
+
+        if (e.Args is ["--worker-pipe", ..])
+        {
+            ShutdownMode = ShutdownMode.OnExplicitShutdown;
+            Shutdown(1);
+            return;
+        }
+
         if (e.Args is ["--worker", .. var workerArgs])
         {
             ShutdownMode = ShutdownMode.OnExplicitShutdown;
             int exitCode = ScannerCli.Execute(workerArgs);
             Shutdown(exitCode);
+            return;
+        }
+
+        try
+        {
+            StartupElevationResult elevation = StartupElevation.Ensure(e.Args,
+                VisDir.Core.ScanCoordinator.IsElevated(), Environment.ProcessPath
+                    ?? throw new InvalidOperationException("The application path is unavailable."), Environment.CurrentDirectory);
+            if (elevation != StartupElevationResult.Continue)
+            {
+                ShutdownMode = ShutdownMode.OnExplicitShutdown;
+                Shutdown();
+                return;
+            }
+        }
+        catch (Exception ex)
+        {
+            SafeLog($"[Startup elevation] {ex}");
+            MessageBox.Show($"VisDir could not start with administrator access.\n\n{ex.Message}",
+                "Unable to start VisDir", MessageBoxButton.OK, MessageBoxImage.Error);
+            ShutdownMode = ShutdownMode.OnExplicitShutdown;
+            Shutdown(1);
             return;
         }
 

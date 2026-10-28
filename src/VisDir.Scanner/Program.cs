@@ -115,34 +115,16 @@ public static class ScannerCli
             long now = Environment.TickCount64;
             if (now - Volatile.Read(ref lastProgressMs) < 500) return;
             Volatile.Write(ref lastProgressMs, now);
-            Console.Error.WriteLine(
-                $"PROGRESS files={p.FilesSeen} dirs={p.DirsSeen} bytes={p.BytesSeen} ms={p.ElapsedMs:F0} " +
-                $"fraction={p.Fraction:F6} phase={Uri.EscapeDataString(p.Phase)}");
+            Console.Error.WriteLine(FormattableString.Invariant(
+                $"PROGRESS files={p.FilesSeen} dirs={p.DirsSeen} bytes={p.BytesSeen} ms={p.ElapsedMs:F0} fraction={p.Fraction:F6} phase={Uri.EscapeDataString(p.Phase)}"));
         });
 
         var options = new ScanOptions { Path = path, Threads = threads };
         var sw = Stopwatch.StartNew();
 
-        ScannerSelection selection = SelectScanner(mode, path);
-        Console.Error.WriteLine($"ENGINE selected={selection.Name} reason={Uri.EscapeDataString(selection.Reason)}");
-        IDiskScanner primary = selection.Scanner;
-        ScanResult result;
-        try
-        {
-            result = primary.Scan(options, cts.Token, progress);
-        }
-        catch (OperationCanceledException)
-        {
-            throw;
-        }
-        catch (Exception ex) when (selection.Name == "mft")
-        {
-            // MFT fast path failed (e.g. access lost mid-scan): fall back to the
-            // compatible scanner so elevated callers still get a result. Both
-            // failures propagate to Execute for exit code 3.
-            Console.Error.WriteLine($"ENGINE selected=generic reason={Uri.EscapeDataString($"fallback-after-mft-failure:{ex.Message}")}");
-            result = new GenericScanner().Scan(options, cts.Token, progress);
-        }
+        var coordinator = new ScanCoordinator();
+        ScanResult result = coordinator.Run(options, mode, cts.Token, progress,
+            selection => Console.Error.WriteLine($"ENGINE selected={selection.Name} reason={Uri.EscapeDataString(selection.Reason)}"));
         sw.Stop();
 
         Console.Error.WriteLine(
@@ -150,15 +132,16 @@ public static class ScannerCli
             $"errors={result.Stats.ErrorCount} bytes={result.Root.TotalAllocated} ms={sw.Elapsed.TotalMilliseconds:F0}");
 
         ScanResult? reference = null;
-        if (diffVerify)
+        if (diffVerify && result.EngineName == "mft" && result.FallbackReason is null)
         {
             try
             {
-                reference = new GenericScanner().Scan(options, cts.Token, null);
+                reference = coordinator.Run(options, "generic", cts.Token, null);
                 Console.Error.WriteLine(
                     $"DONE engine=generic(files) files={reference.Stats.FileCount} " +
                     $"bytes={reference.Root.TotalAllocated} ms={reference.Stats.ElapsedMs:F0}");
             }
+            catch (OperationCanceledException) { throw; }
             catch (Exception ex)
             {
                 Console.Error.WriteLine($"DIFF reference scan failed: {ex.Message}");
@@ -187,7 +170,7 @@ public static class ScannerCli
         if (report || outFile is null)
             PrintReport(result, top, reference);
 
-        if (reference is not null)
+        if (diffVerify)
             return DiffCheck(result, reference);
         return 0;
     }
@@ -311,140 +294,24 @@ public static class ScannerCli
         finally { NativeMethods.CloseHandle(hVol); }
     }
 
-    private sealed record ScannerSelection(IDiskScanner Scanner, string Name, string Reason);
-
-    private static ScannerSelection SelectScanner(string mode, string path)
+    private static int DiffCheck(ScanResult primary, ScanResult? reference)
     {
-        switch (mode)
-        {
-            case "generic":
-                return new ScannerSelection(new GenericScanner(), "generic", "Compatible scan selected");
-            case "mft":
-                return new ScannerSelection(new NtfsMftScanner(), "mft", "Fast NTFS scan selected");
-            default:
-            {
-                // auto: MFT for drive-letter roots when elevated, generic otherwise.
-                string root = PathUtils.NormalizeScanRoot(path);
-                bool isNtfs = false;
-                if (root.Length == 3 && root[1] == ':' && root.EndsWith("\\"))
-                {
-                    try { isNtfs = string.Equals(VolumeQuery.Query(root).FileSystemName, "NTFS", StringComparison.OrdinalIgnoreCase); }
-                    catch { /* compatible scanner will report any underlying access error */ }
-                }
-                if (root.Length == 3 && root[1] == ':' && root.EndsWith("\\") &&
-                    Directory.Exists(root) && isNtfs && IsElevated())
-                {
-                    return new ScannerSelection(new NtfsMftScanner(), "mft", "Administrator access available; using fast NTFS scan");
-                }
-                string reason = root.Length == 3 && root[1] == ':' && isNtfs
-                    ? "Using compatible scan; choose Fast NTFS to request administrator access"
-                    : root.Length == 3 && root[1] == ':'
-                        ? "This filesystem uses the compatible scanner"
-                        : "Folder and network paths use the compatible scanner";
-                return new ScannerSelection(new GenericScanner(), "generic", reason);
-            }
-        }
-    }
-
-    private static bool IsElevated()
-    {
-        using var identity = System.Security.Principal.WindowsIdentity.GetCurrent();
-        var principal = new System.Security.Principal.WindowsPrincipal(identity);
-        return principal.IsInRole(System.Security.Principal.WindowsBuiltInRole.Administrator);
-    }
-
-    /// <summary>Compares two scans of the same volume; returns exit code 0 when within tolerance.</summary>
-    /// <remarks>Engine contract (documented, not equalized): MFT counts INDEX_ALLOCATION
-    /// plus ADS bytes while generic counts unnamed $DATA only, so small systematic
-    /// differences are expected and the 1% tolerance absorbs them.</remarks>
-    private static int DiffCheck(ScanResult mft, ScanResult generic)
-    {
+        ComparisonResult comparison = ScanComparison.Compare(primary, reference);
         Console.WriteLine();
-        Console.WriteLine("=== DIFF: MFT vs Generic ===");
-        Console.WriteLine($"Total allocated: mft={SizeFormatter.Format(mft.Root.TotalAllocated)}  " +
-                          $"generic={SizeFormatter.Format(generic.Root.TotalAllocated)}");
-
-        double deltaPct = generic.Root.TotalAllocated > 0
-            ? Math.Abs((double)mft.Root.TotalAllocated - generic.Root.TotalAllocated) / generic.Root.TotalAllocated * 100
-            : 0;
-        Console.WriteLine($"Delta: {deltaPct:0.00}%");
-
-        var gKids = generic.Root.Children ?? new List<FsNode>();
-        var mKids = new Dictionary<string, ulong>(
-            (mft.Root.Children ?? new List<FsNode>()).Select(c => KeyValuePair.Create(c.Name, c.TotalAllocated)),
-            StringComparer.OrdinalIgnoreCase);
-
-        double worst = 0;
-        string worstName = "";
-        foreach (FsNode g in gKids.Take(30))
+        Console.WriteLine($"DIFF {comparison.Status.ToString().ToUpperInvariant()}: MFT vs Compatible");
+        Console.WriteLine($"Comparable allocation: MFT={comparison.PrimaryBytes:N0}, Compatible={comparison.ReferenceBytes:N0} bytes");
+        if (comparison.ExcludedBytes > 0)
+            Console.WriteLine($"Explicitly excluded MFT metadata/stream allocation: {comparison.ExcludedBytes:N0} bytes");
+        foreach (string detail in comparison.Details) Console.WriteLine("  " + detail);
+        if (comparison.MismatchCount > comparison.Details.Count)
+            Console.WriteLine($"  {comparison.MismatchCount - comparison.Details.Count:N0} additional mismatches");
+        return comparison.Status switch
         {
-            ulong m = mKids.TryGetValue(g.Name, out ulong v) ? v : 0;
-            double pct = g.TotalAllocated > 1024 * 1024
-                ? Math.Abs((double)m - g.TotalAllocated) / g.TotalAllocated * 100
-                : 0;
-            if (pct > worst && m < g.TotalAllocated) { worst = pct; worstName = g.Name; }
-            if (pct > 1 && m < g.TotalAllocated)
-                Console.WriteLine($"  MISMATCH {g.Name}: mft={SizeFormatter.Format(m)} generic={SizeFormatter.Format(g.TotalAllocated)} ({pct:0.0}%)");
-            else if (pct > 25)
-                Console.WriteLine($"  EXTRA-VISIBILITY {g.Name}: mft sees {SizeFormatter.Format(m - g.TotalAllocated)} more (shadow copies/system metadata)");
-        }
-
-        Console.WriteLine(worst <= 1
-            ? "DIFF PASS: all top-level items within 1% tolerance."
-            : $"DIFF WORST: {worstName} at {worst:0.0}%");
-
-        // Leaf-level evidence: top 15 files from each engine, matched by name.
-        var mTop = TopLeafFiles(mft, 300);
-        var gTop = TopLeafFiles(generic, 300);
-        var gByName = new Dictionary<string, List<ulong>>(StringComparer.OrdinalIgnoreCase);
-        foreach ((string p, ulong sz) in gTop)
-        {
-            string key = Path.GetFileName(p);
-            if (!gByName.TryGetValue(key, out var list)) gByName[key] = list = new List<ulong>();
-            list.Add(sz);
-        }
-
-        Console.WriteLine();
-        Console.WriteLine("Largest files — mft vs generic (only mismatches shown):");
-        int shown = 0;
-        foreach ((string path, ulong alloc) in mTop)
-        {
-            string name = Path.GetFileName(path);
-            if (name.StartsWith('$') || name.StartsWith('{')) continue; // system artifacts: generic can't see these by design
-            ulong gAlloc = 0;
-            if (gByName.TryGetValue(name, out var candidates))
-            {
-                // Match against the closest candidate size (names repeat across folders).
-                gAlloc = candidates.OrderBy(s => Math.Abs((long)s - (long)alloc)).First();
-            }
-            double pctDiff = alloc > 1024 * 1024 || gAlloc > 1024 * 1024
-                ? Math.Abs((double)alloc - gAlloc) / Math.Max(alloc, gAlloc) * 100
-                : 0;
-            if (pctDiff > 2 && shown++ < 15)
-                Console.WriteLine($"  {name,-50} mft={SizeFormatter.Format(alloc),10} generic={SizeFormatter.Format(gAlloc),10}");
-        }
-        if (shown == 0) Console.WriteLine("  (top files match)");
-
-        return worst <= 1 ? 0 : 4;
+            ComparisonStatus.Passed => 0,
+            ComparisonStatus.Failed => 4,
+            _ => 5,
+        };
     }
-
-    private static List<(string Path, ulong Alloc)> TopLeafFiles(ScanResult r, int n)
-    {
-        var leaves = new List<(string, ulong)>();
-        var stack = new Stack<FsNode>();
-        stack.Push(r.Root);
-        while (stack.Count > 0)
-        {
-            FsNode node = stack.Pop();
-            if (node.Children is { } kids)
-                foreach (FsNode k in kids) stack.Push(k);
-            else if ((node.Flags & NodeFlags.Directory) == 0)
-                leaves.Add((node.GetPath(), node.AllocatedSize));
-        }
-        leaves.Sort(static (a, b) => b.Item2.CompareTo(a.Item2));
-        return leaves.Take(n).ToList();
-    }
-
     private static void PrintReport(ScanResult result, int top, ScanResult? reference = null)
     {
         var v = result.Volume;
@@ -531,13 +398,15 @@ public static class ScannerCli
         Console.Error.WriteLine("""
             VisDir.Scanner — disk usage scanner
             Usage:
-              VisDir.Scanner <path> [--out <file.vdir>] [--report] [--top N] [--threads N]
+              VisDir.App --worker <path> [--mode auto|mft|generic] [--out <file.vdir>] [--report] [--top N] [--threads N] [--diff]
 
               path       directory or drive root to scan (e.g. C:\)
               --out      write binary snapshot file
               --report   print human-readable summary
               --top N    items in report (default 25)
               --threads N worker threads (default: CPU count)
+              --diff     verify MFT against an independent Compatible scan
+                         exit 0: pass; 4: mismatch; 5: inconclusive (partial/fallback/missing reference)
             """);
     }
 

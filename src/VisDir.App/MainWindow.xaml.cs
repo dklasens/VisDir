@@ -96,7 +96,7 @@ public sealed class FileItemView : INotifyPropertyChanged
 
 public partial class MainWindow : Window
 {
-    private readonly ScanService _scanner = new();
+    private readonly ScanService _scanner;
     private readonly DispatcherTimer _driveRefreshTimer;
     private readonly List<DriveChoice> _customTargets = [];
     private List<DriveChoice> _drives = [];
@@ -114,17 +114,20 @@ public partial class MainWindow : Window
     /// <summary>Bound to <see cref="ChildrenList"/> once; rebuilds diff into it so virtualization
     /// containers (Recycling) survive filter keystrokes instead of regenerating from scratch.</summary>
     private readonly ObservableCollection<FileItemView> _fileItems = new();
-    private FileItemView? _aggregatedItem;
-    // Wedge-rank + chip-brush cache, valid for one folder view (identical across filter keystrokes).
-    private FsNode? _rankRoot;
-    private int _rankChildCount = -1;
-    private ulong _rankTotal;
-    private Dictionary<FsNode, int> _rankOf = new(ReferenceEqualityComparer.Instance);
-    private Brush[] _branchBrushes = [];
-    private long _lastProgressUiMs; // 10Hz gate for scan progress (Environment.TickCount64)
+    private readonly DirectoryViewSession _viewSession = new();
+    private int _listSequence;
+    private Task _listBuildTask = Task.CompletedTask;
+    private CancellationTokenSource? _listCancellation;
+    private int _pageIndex;
+    private bool _showAllItems;
+    private bool _refreshingDrives;
+    private bool _closed;
 
-    public MainWindow()
+    public MainWindow() : this(new ScanService()) { }
+
+    internal MainWindow(ScanService scanner)
     {
+        _scanner = scanner;
         InitializeComponent();
         ChildrenList.ItemsSource = _fileItems;
         ApplySystemContrast();
@@ -147,29 +150,47 @@ public partial class MainWindow : Window
             if (!_suppressFilterRebuild) RebuildFileList();
         };
 
-        // Scanner callbacks arrive on worker threads: never block them (BeginInvoke),
-        // and coalesce progress to 10Hz (ScanService also gates at the source).
-        _scanner.ProgressChanged += OnScanProgressThrottled;
-        _scanner.StatusChanged += s => Dispatcher.BeginInvoke(() => ScanPhaseText.Text = s);
-        _scanner.Completed += r => Dispatcher.BeginInvoke(() => { _ = OnScanCompletedAsync(r); });
+        // ScanService coalesces progress. Preserve its phase transitions and endpoints
+        // when forwarding callbacks to the dispatcher.
+        _scanner.ProgressChanged += OnScanProgressChanged;
+        _scanner.StatusChanged += status =>
+        {
+            int scanId = _scanner.ScanId;
+            Dispatcher.BeginInvoke(() =>
+            {
+                if (!_closed && _scanner.IsCurrent(scanId)) ScanPhaseText.Text = status;
+            });
+        };
+        _scanner.Completed += r =>
+        {
+            int scanId = _scanner.ScanId;
+            Dispatcher.BeginInvoke(() => { _ = OnScanCompletedAsync(r, scanId); });
+        };
         _scanner.Failed += msg => Dispatcher.BeginInvoke(() =>
         {
+            if (_closed || _scanner.IsScanning) return;
             ScanOverlay.Visibility = Visibility.Collapsed;
             MessageBox.Show(this, msg, "Scan Failed", MessageBoxButton.OK, MessageBoxImage.Warning);
             if (_result is null) ShowLandingView();
         });
         _scanner.Cancelled += () => Dispatcher.BeginInvoke(() =>
         {
+            if (_closed || _scanner.IsScanning) return;
             ScanOverlay.Visibility = Visibility.Collapsed;
             if (_result is null) ShowLandingView();
         });
 
-        Burst.HoveredChanged += node => Dispatcher.Invoke(() =>
+        Burst.HoveredChanged += _ => Dispatcher.Invoke(() =>
         {
-            // Hover drives the center readout only; the list no longer follows it.
-            FsNode? target = node ?? _selectedNode ?? _viewRoot;
-            UpdateSelectedNodeInfo(target);
+            // The footer and its Explorer action always describe the persistent selection.
+            UpdateSelectedNodeInfo(_selectedNode);
         });
+        Burst.NodeSelected += node =>
+        {
+            _selectedNode = node;
+            UpdateSelectedNodeInfo(node);
+            SyncListSelection(node);
+        };
         Burst.NodeClicked += node => Dispatcher.Invoke(() =>
         {
             _selectedNode = node;
@@ -186,9 +207,14 @@ public partial class MainWindow : Window
         });
 
         Burst.CenterClicked += () => Dispatcher.Invoke(NavigateUp);
+        Burst.AggregateClicked += ShowAllItems;
 
         Closed += (_, _) =>
         {
+            _closed = true;
+            _listCancellation?.Cancel();
+            _listCancellation?.Dispose();
+            _viewSession.Dispose();
             SystemParameters.StaticPropertyChanged -= OnSystemParametersChanged;
             _driveRefreshTimer.Stop();
             _filterDebounce.Stop();
@@ -297,64 +323,95 @@ public partial class MainWindow : Window
     [DllImport("dwmapi.dll")]
     private static extern int DwmSetWindowAttribute(IntPtr window, int attribute, ref int value, int valueSize);
 
-    private void RefreshDrives(bool onlyWhenChanged = false)
+    private async void RefreshDrives(bool onlyWhenChanged = false)
     {
-        string? selectedPath = (DriveCards.SelectedItem as DriveChoice)?.RootPath;
-        var fresh = new List<DriveChoice>();
-        foreach (DriveInfo drive in DriveInfo.GetDrives()
-                     .Where(d => d.DriveType is DriveType.Fixed or DriveType.Removable && d.IsReady)
-                     .OrderBy(d => d.Name))
+        if (_refreshingDrives || _closed) return;
+        _refreshingDrives = true;
+        try
         {
-            try
+            List<DriveChoice> fresh = await Task.Run(() =>
             {
-                ulong total = (ulong)drive.TotalSize;
-                ulong free = (ulong)drive.AvailableFreeSpace;
-                double used = total > 0 ? (double)(total - free) / total : 0;
-                string rootLabel = drive.Name.TrimEnd('\\');
-                string name = string.IsNullOrWhiteSpace(drive.VolumeLabel) ? rootLabel : $"{drive.VolumeLabel} ({rootLabel})";
-                fresh.Add(new DriveChoice
+                var choices = new List<DriveChoice>();
+                foreach (DriveInfo drive in DriveInfo.GetDrives())
                 {
-                    DisplayName = name,
-                    RootPath = drive.RootDirectory.FullName,
-                    CapacityText = $"{SizeFormatter.Format(total)} capacity",
-                    FreeText = $"{SizeFormatter.Format(free)} free of {SizeFormatter.Format(total)}",
-                    UsedFraction = used,
-                    IsVolumeRoot = true,
-                    SupportsFastScan = string.Equals(drive.DriveFormat, "NTFS", StringComparison.OrdinalIgnoreCase),
-                    TotalBytes = total,
-                    FreeBytes = free,
-                });
-            }
-            catch { /* drive disappeared during refresh */ }
+                    try
+                    {
+                        if (drive.DriveType is not (DriveType.Fixed or DriveType.Removable) || !drive.IsReady) continue;
+                        ulong total = (ulong)drive.TotalSize;
+                        ulong free = Math.Min(total, (ulong)drive.AvailableFreeSpace);
+                        string rootLabel = drive.Name.TrimEnd('\\');
+                        choices.Add(new DriveChoice
+                        {
+                            DisplayName = string.IsNullOrWhiteSpace(drive.VolumeLabel) ? rootLabel : $"{drive.VolumeLabel} ({rootLabel})",
+                            RootPath = drive.RootDirectory.FullName,
+                            CapacityText = $"{SizeFormatter.Format(total)} capacity",
+                            FreeText = $"{SizeFormatter.Format(free)} free of {SizeFormatter.Format(total)}",
+                            UsedFraction = total > 0 ? (double)(total - free) / total : 0,
+                            IsVolumeRoot = true,
+                            SupportsFastScan = string.Equals(drive.DriveFormat, "NTFS", StringComparison.OrdinalIgnoreCase),
+                            TotalBytes = total, FreeBytes = free,
+                        });
+                    }
+                    catch { /* Removed or temporarily unavailable media. */ }
+                }
+                return choices.OrderBy(d => d.RootPath, StringComparer.OrdinalIgnoreCase).ToList();
+            });
+            if (_closed) return;
+            fresh.AddRange(_customTargets);
+            string signature = string.Join('|', fresh.Select(d => $"{d.RootPath}:{d.DisplayName}:{d.FreeBytes}"));
+            string previous = string.Join('|', _drives.Select(d => $"{d.RootPath}:{d.DisplayName}:{d.FreeBytes}"));
+            if (onlyWhenChanged && signature == previous) return;
+            string? selectedPath = (DriveCards.SelectedItem as DriveChoice)?.RootPath;
+            _drives = fresh;
+            DriveCards.ItemsSource = _drives;
+            DriveCards.SelectedItem = fresh.FirstOrDefault(d => PathsEqual(d.RootPath, selectedPath)) ?? fresh.FirstOrDefault();
         }
-        fresh.AddRange(_customTargets);
+        catch { /* Retain the last successful drive inventory. */ }
+        finally { _refreshingDrives = false; }
+    }
 
-        string signature = string.Join('|', fresh.Select(d => $"{d.RootPath}:{d.UsedFraction:F5}"));
-        string currentSignature = string.Join('|', _drives.Select(d => $"{d.RootPath}:{d.UsedFraction:F5}"));
-        if (onlyWhenChanged && signature == currentSignature) return;
-
-        _drives = fresh;
-        DriveCards.ItemsSource = _drives;
-        DriveChoice? selection = _drives.FirstOrDefault(d => PathsEqual(d.RootPath, selectedPath)) ?? _drives.FirstOrDefault();
-        DriveCards.SelectedItem = selection;
+    private void ClearViewState()
+    {
+        _viewSession.Reset(null);
+        _listCancellation?.Cancel();
+        _listCancellation?.Dispose();
+        _listCancellation = null;
+        _listBuildTask = Task.CompletedTask;
+        Interlocked.Increment(ref _layoutSequence);
+        Interlocked.Increment(ref _listSequence);
+        _filterDebounce.Stop();
+        _result = null;
+        _viewRoot = null;
+        _selectedNode = null;
+        _sunburstContextNode = null;
+        _backHistory.Clear();
+        _forwardHistory.Clear();
+        Burst.PendingLayout = null;
+        Burst.ViewRoot = null;
+        Burst.Volume = null;
+        Burst.SelectedSource = null;
+        _fileItems.Clear();
+        _fileItemByNode.Clear();
+        ListResultCount.Text = "";
+        ListPagingButtons.Visibility = Visibility.Collapsed;
+        ShowAllItemsButton.Visibility = Visibility.Collapsed;
+        EmptyListText.Visibility = Visibility.Collapsed;
+        _pageIndex = 0;
+        _showAllItems = false;
+        ClearSearchFilter();
+        UpdateSelectedNodeInfo(null);
     }
 
     private void ShowLandingView()
     {
-        _result = null;
-        _viewRoot = null;
-        _selectedNode = null;
-        _backHistory.Clear();
-        _forwardHistory.Clear();
-        Burst.ViewRoot = null;
-        Burst.Volume = null;
-        _fileItems.Clear();
-        _aggregatedItem = null;
-        _fileItemByNode.Clear();
+        if (_scanner.IsScanning) _scanner.Cancel();
+        ClearViewState();
+        ScanOverlay.Visibility = Visibility.Collapsed;
         LandingPanel.Visibility = Visibility.Visible;
         ContentShell.Visibility = Visibility.Collapsed;
         EngineBadge.Visibility = Visibility.Collapsed;
         ScanWarningBadge.Visibility = Visibility.Collapsed;
+        FastScanButton.Visibility = Visibility.Collapsed;
         RescanButton.Visibility = Visibility.Collapsed;
         BreadcrumbBar.Children.Clear();
         DisksRootButton.IsEnabled = false;
@@ -420,17 +477,6 @@ public partial class MainWindow : Window
     {
         if (_scanner.IsScanning) return;
 
-        bool isDriveRoot = Path.GetPathRoot(path)?.Equals(path, StringComparison.OrdinalIgnoreCase) ?? false;
-        if (mode == "mft" && !isDriveRoot)
-        {
-            mode = "generic";
-        }
-        if (mode == "mft" && !IsElevated())
-        {
-            RequestElevatedRestart(path);
-            return;
-        }
-
         LandingPanel.Visibility = Visibility.Collapsed;
         ContentShell.Visibility = Visibility.Visible;
         ScanOverlay.Visibility = Visibility.Visible;
@@ -440,17 +486,12 @@ public partial class MainWindow : Window
         ScanPhaseText.Text = "Initializing scan…";
         DisksRootButton.IsEnabled = true;
 
+        ClearViewState();
         BreadcrumbBar.Children.Clear();
-        Burst.ViewRoot = null;
-        _result = null;
-        _viewRoot = null;
-        _selectedNode = null;
-        _backHistory.Clear();
-        _forwardHistory.Clear();
+        EngineBadge.Visibility = Visibility.Collapsed;
+        FastScanButton.Visibility = Visibility.Collapsed;
+        RescanButton.Visibility = Visibility.Collapsed;
         UpdateHistoryButtons();
-
-        _fileItems.Clear();
-        _aggregatedItem = null;
         CurrentFolderName.Text = Path.GetFileName(path) is { Length: > 0 } fn ? fn : path;
         CurrentFolderTotalSize.Text = "Scanning…";
         UpdateSelectedNodeInfo(null);
@@ -467,18 +508,15 @@ public partial class MainWindow : Window
         }
     }
 
-    /// <summary>10Hz-coalesced progress: drops bursts instead of queueing UI work, never blocks the worker.</summary>
-    private void OnScanProgressThrottled(double fraction)
+    private void OnScanProgressChanged(double fraction)
     {
-        long now = Environment.TickCount64;
-        if (now - Interlocked.Read(ref _lastProgressUiMs) < 100) return;
-        Interlocked.Exchange(ref _lastProgressUiMs, now);
+        int scanId = _scanner.ScanId;
         Dispatcher.BeginInvoke(() =>
         {
-            // Volume-based fractions sit near zero for most of a folder scan (bytes seen vs whole-disk
-            // used space), which read as a frozen bar. Only go determinate on a real sweep (MFT read);
-            // otherwise the marquee plus live file/folder counts carry the progress signal.
-            if (fraction is >= 0.02 and < 1)
+            if (_closed || !_scanner.IsCurrent(scanId)) return;
+            // Known fractions describe either MFT records or snapshot nodes loaded. The
+            // unknown-length directory walk reports -1 and keeps its marquee.
+            if (double.IsFinite(fraction) && fraction is >= 0 and <= 1)
             {
                 ScanProgressBar.IsIndeterminate = false;
                 ScanProgressBar.Value = fraction;
@@ -490,79 +528,70 @@ public partial class MainWindow : Window
         });
     }
 
-    private async Task OnScanCompletedAsync(ScanResult result)
+    private async Task OnScanCompletedAsync(ScanResult result, int scanId)
     {
+        if (!_scanner.IsCurrent(scanId) || _closed) return;
         _result = result;
-
-        EngineBadge.Visibility = Visibility.Visible;
-        string engineKey = result.EngineName?.Trim().ToLowerInvariant() ?? "";
-        EngineBadgeText.Text = engineKey switch
+        _viewSession.Reset(result.Root);
+        long generation = _viewSession.Generation;
+        CancellationToken token = _viewSession.Token;
+        try
         {
-            "mft" => "FAST NTFS",
-            "generic" or "compatible" => "COMPATIBLE",
-            { Length: > 0 } => engineKey.ToUpperInvariant(),
-            _ => "SCANNED",
-        };
-        EngineBadge.ToolTip = engineKey switch
-        {
-            "mft" => "Fast NTFS Engine: Directly indexing the Master File Table ($MFT). Bypasses file system overhead and accounts for all physical disk blocks.",
-            "generic" or "compatible" => "Compatible Engine: Scanning via Windows directory traversal. Standard file permissions apply. Run as Administrator for Fast NTFS.",
-            _ => null,
-        };
-        RescanButton.Visibility = Visibility.Visible;
-        if (result.Stats.ErrorCount > 0)
-        {
-            ScanWarningText.Text = $"{result.Stats.ErrorCount:N0} unreadable location{(result.Stats.ErrorCount == 1 ? "" : "s")}";
-            ScanWarningBadge.ToolTip = "Click to view unreadable location details and options to scan as Administrator.";
-            ScanWarningBadge.Visibility = Visibility.Visible;
+            ScanProgressBar.IsIndeterminate = true;
+            ScanPhaseText.Text = "Preparing disk map…";
+            SunburstNode layout = await Task.Run(() => SunburstLayout.Build(result.Root,
+                maxDepth: SunburstControl.MaxVisibleDepth, cancellationToken: token), token);
+            if (!_scanner.IsCurrent(scanId) || !_viewSession.IsCurrent(generation, result.Root) || _closed) return;
+            string engineKey = result.EngineName.Trim().ToLowerInvariant();
+            EngineBadgeText.Text = engineKey == "mft" ? "FAST NTFS" : "COMPATIBLE";
+            EngineBadge.ToolTip = engineKey == "mft"
+                ? "Fast NTFS reads filesystem metadata, including allocated streams and directory indexes."
+                : "Compatible scan uses Windows directory enumeration. Some protected files may be unavailable.";
+            EngineBadge.Visibility = Visibility.Visible;
+            RescanButton.Visibility = Visibility.Visible;
+            FastScanButton.Visibility = engineKey != "mft" && result.RequestedEngine != "mft" && !IsElevated()
+                ? Visibility.Visible : Visibility.Collapsed;
+            ScanWarningText.Text = result.Stats.ErrorCount > 0 ? $"{result.Stats.ErrorCount:N0} scan issues"
+                : result.Completeness == ScanCompleteness.Partial ? "Partial scan" : "Scan details";
+            ScanWarningBadge.Visibility = result.Completeness == ScanCompleteness.Partial || result.Issues.Count > 0 ||
+                result.Stats.ErrorCount > 0 || result.FallbackReason is not null
+                ? Visibility.Visible : Visibility.Collapsed;
+            ScanWarningBadge.ToolTip = "View scan limitations and affected locations";
+            Burst.Volume = result.Volume;
+            Burst.PendingLayout = layout;
+            NavigateInto(result.Root, recordHistory: false);
+            await _listBuildTask;
+            if (!_scanner.IsCurrent(scanId) || !_viewSession.IsCurrent(generation, result.Root) || _closed) return;
+            ScanOverlay.Visibility = Visibility.Collapsed;
         }
-        else
+        catch (OperationCanceledException) { }
+        catch (Exception ex)
         {
-            ScanWarningBadge.Visibility = Visibility.Collapsed;
+            if (!_closed && _scanner.IsCurrent(scanId))
+            {
+                ScanOverlay.Visibility = Visibility.Collapsed;
+                MessageBox.Show(this, ex.Message, "Could not prepare disk map", MessageBoxButton.OK, MessageBoxImage.Warning);
+            }
         }
-
-        _backHistory.Clear();
-        _forwardHistory.Clear();
-        UpdateHistoryButtons();
-
-        // First layout builds off-UI-thread (FsNode/SunburstNode are free-threaded);
-        // the overlay stays indeterminate until NavigateInto returns. Bumping the
-        // sequence abandons any in-flight navigation layout from the previous scan.
-        ScanProgressBar.IsIndeterminate = true;
-        Interlocked.Increment(ref _layoutSequence);
-        Burst.PendingLayout = await Task.Run(() => SunburstLayout.Build(result.Root, maxDepth: SunburstControl.MaxVisibleDepth));
-        Burst.Volume = result.Volume;
-        NavigateInto(result.Root, recordHistory: false);
-        ScanOverlay.Visibility = Visibility.Collapsed;
+        finally { _scanner.AcceptResult(scanId); }
     }
 
     private void OnScanWarningBadgeClick(object sender, RoutedEventArgs e)
     {
-        if (_result is null || _result.Stats.ErrorCount == 0) return;
+        if (_result is not { } result) return;
+        string details = string.Join("\n", result.Issues.Take(12).Select(issue => $"{issue.Path}: {issue.Reason}"));
+        string summary = result.Stats.ErrorCount > 0
+            ? $"{result.Stats.ErrorCount:N0} location(s) could not be fully measured. Reported sizes may be incomplete."
+            : "Scan details";
+        if (result.FallbackReason is { Length: > 0 } fallback) summary += $"\n\n{fallback}";
+        if (details.Length > 0) summary += $"\n\n{details}";
+        if (result.Issues.Count > 12) summary += $"\n…and {result.Issues.Count - 12:N0} more reported locations.";
+        MessageBox.Show(this, summary, "Scan details", MessageBoxButton.OK, MessageBoxImage.Information);
+    }
 
-        if (!IsElevated())
-        {
-            MessageBoxResult answer = MessageBox.Show(
-                this,
-                $"{_result.Stats.ErrorCount:N0} location(s) could not be read due to Windows access permissions (e.g., System Volume Information, System Restore snapshots, protected system logs).\n\nWould you like to relaunch VisDir as Administrator to scan the entire drive with the Fast NTFS engine?",
-                "Unreadable Locations Detected",
-                MessageBoxButton.YesNo,
-                MessageBoxImage.Warning);
-
-            if (answer == MessageBoxResult.Yes)
-            {
-                RequestElevatedRestart(_result.Root.Name);
-            }
-        }
-        else
-        {
-            MessageBox.Show(
-                this,
-                $"{_result.Stats.ErrorCount:N0} location(s) could not be read. VisDir is running with elevated Administrator privileges, but these locations are currently locked by the operating system or system kernel services.",
-                "Unreadable Locations",
-                MessageBoxButton.OK,
-                MessageBoxImage.Information);
-        }
+    private void OnFastScanClick(object sender, RoutedEventArgs e)
+    {
+        if (_viewRoot is { } root) StartScan(root.GetPath(), "mft");
     }
 
     private int _layoutSequence;
@@ -581,8 +610,11 @@ public partial class MainWindow : Window
         // entered subtree is built, and only down to MaxVisibleDepth.
         _filterDebounce.Stop();
         ClearSearchFilter();
+        if (!ReferenceEquals(_viewSession.Root, node)) _viewSession.Reset(node);
         _viewRoot = node;
         _selectedNode = node;
+        _pageIndex = 0;
+        _showAllItems = false;
 
         CurrentFolderName.Text = node.Name.TrimEnd('\\');
         if (CurrentFolderName.Text.Length == 0) CurrentFolderName.Text = node.Name;
@@ -601,11 +633,16 @@ public partial class MainWindow : Window
             return;
         }
         int seq = Interlocked.Increment(ref _layoutSequence);
-        SunburstNode layout = await Task.Run(() => SunburstLayout.Build(node, maxDepth: SunburstControl.MaxVisibleDepth));
-        if (seq != Volatile.Read(ref _layoutSequence)) return;
-        if (!ReferenceEquals(_viewRoot, node)) return;
-        Burst.PendingLayout = layout;
-        Burst.ViewRoot = node;
+        CancellationToken token = _viewSession.Token;
+        try
+        {
+            SunburstNode layout = await Task.Run(() => SunburstLayout.Build(node,
+                maxDepth: SunburstControl.MaxVisibleDepth, cancellationToken: token), token);
+            if (seq != Volatile.Read(ref _layoutSequence) || !ReferenceEquals(_viewRoot, node) || _closed) return;
+            Burst.PendingLayout = layout;
+            Burst.ViewRoot = node;
+        }
+        catch (OperationCanceledException) { }
     }
 
     private void NavigateUp()
@@ -684,144 +721,97 @@ public partial class MainWindow : Window
         }
     }
 
-    private void RebuildFileList()
+    private void RebuildFileList() => _listBuildTask = RebuildFileListAsync();
+
+    private async Task RebuildFileListAsync()
     {
-        if (_viewRoot is null) return;
+        if (_viewRoot is not { } root) return;
         string query = SearchBox.Text.Trim();
-        IReadOnlyList<FsNode> allChildren = _viewRoot.Children ?? [];
-        IEnumerable<FsNode> children = allChildren;
-        if (query.Length > 0) children = children.Where(n => n.Name.Contains(query, StringComparison.OrdinalIgnoreCase));
-        List<FsNode> nodes = children.ToList();
-        // Cap search materialization so a huge match set can't build unbounded rows.
-        const int MaxSearchItems = 1000;
-        if (query.Length > 0 && nodes.Count > MaxSearchItems) nodes.RemoveRange(MaxSearchItems, nodes.Count - MaxSearchItems);
-        ulong viewTotal = _viewRoot.TotalAllocated;
-
-        // Wedge ranks + chip brushes are identical for every keystroke within one folder view;
-        // recompute only when the viewed folder, its child count, or its total changes.
-        if (!ReferenceEquals(_rankRoot, _viewRoot) || _rankChildCount != allChildren.Count || _rankTotal != viewTotal)
+        bool showAll = _showAllItems;
+        int requestedPage = _pageIndex;
+        int sequence = Interlocked.Increment(ref _listSequence);
+        _listCancellation?.Cancel();
+        _listCancellation?.Dispose();
+        _listCancellation = CancellationTokenSource.CreateLinkedTokenSource(_viewSession.Token);
+        CancellationToken token = _listCancellation.Token;
+        try
         {
-            var rankOf = new Dictionary<FsNode, int>(allChildren.Count, ReferenceEqualityComparer.Instance);
-            int branchCount = 0;
-            const double minSweep = 0.006;
-            for (int i = 0; i < allChildren.Count; i++)
+            DirectoryPage page = await Task.Run(() => DirectoryViewModel.Build(root, query, showAll, requestedPage, token), token);
+            if (sequence != _listSequence || !ReferenceEquals(root, _viewRoot) || _closed) return;
+            _pageIndex = page.PageIndex;
+            int branchCount = Math.Max(1, page.BranchRanks.Count);
+            Brush[] brushes = Enumerable.Range(0, branchCount).Select(i => Palette.BrushForBranch(i, branchCount)).ToArray();
+            CurrentFolderDot.Background = brushes[0];
+            Brush normal = (Brush)FindResource("TextBrush");
+            Brush dim = (Brush)FindResource("DimBrush");
+            FsNode? selection = _selectedNode;
+            var byNode = new Dictionary<FsNode, FileItemView>(ReferenceEqualityComparer.Instance);
+            var wanted = new List<FileItemView>(page.Nodes.Count + 1);
+            foreach (FsNode node in page.Nodes)
             {
-                FsNode child = allChildren[i];
-                bool isVisibleWedge = viewTotal == 0 || i == 0 ||
-                    SunburstLayout.FullCircle * child.TotalAllocated / viewTotal >= minSweep;
-                if (isVisibleWedge) rankOf[child] = branchCount++;
+                double fraction = root.TotalAllocated > 0 ? (double)node.TotalAllocated / root.TotalAllocated : 0;
+                string tip = $"{node.Name}\n{SizeFormatter.Format(node.TotalAllocated)} on disk · {(node.IsDirectory ? "Folder" : "File")} · {fraction:P1} of this folder";
+                Brush chip = ChipBrushFor(node, page.BranchRanks, brushes);
+                if (!_fileItemByNode.TryGetValue(node, out FileItemView? item))
+                    item = new FileItemView(node, chip, normal, normal, tip);
+                else item.Refresh(chip, normal, normal, tip);
+                byNode[node] = item;
+                wanted.Add(item);
             }
-
-            // One frozen brush per visible branch; rows share instances instead of allocating per row.
-            int brushCount = Math.Max(branchCount, 1);
-            var branchBrushes = new Brush[brushCount];
-            for (int i = 0; i < brushCount; i++) branchBrushes[i] = Palette.BrushForBranch(i, brushCount, 1);
-
-            _rankRoot = _viewRoot;
-            _rankChildCount = allChildren.Count;
-            _rankTotal = viewTotal;
-            _rankOf = rankOf;
-            _branchBrushes = branchBrushes;
-        }
-
-        // Set active folder dot color
-        CurrentFolderDot.Background = _branchBrushes[0];
-
-        var normalTextBrush = TryFindResource("TextBrush") as Brush ?? Brushes.White;
-        var dimTextBrush = TryFindResource("DimBrush") as Brush ?? new SolidColorBrush(Color.FromRgb(0x8E, 0x95, 0xAA));
-
-        FsNode? previouslySelected = (ChildrenList.SelectedItem as FileItemView)?.Node;
-
-        // Build the desired order, reusing live row instances (with their cached SizeText/ToolTipText)
-        // so surviving rows keep their virtualized containers and selection.
-        var wanted = new List<FileItemView>(nodes.Count + 1);
-        ulong aggregatedBytes = 0;
-        int aggregatedCount = 0;
-        foreach (FsNode node in nodes)
-        {
-            bool isVisible = _rankOf.ContainsKey(node);
-            if (!isVisible && query.Length == 0)
+            if (page.IncludesSmallerGroup)
             {
-                aggregatedBytes += node.TotalAllocated;
-                aggregatedCount++;
-                continue;
+                var node = new FsNode { Name = $"smaller objects… ({page.SmallerCount:N0})", TotalAllocated = page.SmallerBytes, Flags = NodeFlags.Directory };
+                wanted.Add(new FileItemView(node, Palette.AggregatedBrush, dim, dim,
+                    "Open to browse every item in this folder", isAggregated: true));
             }
-
-            double fraction = viewTotal > 0 ? (double)node.TotalAllocated / viewTotal : 0;
-            string tip = $"{node.Name}\n{SizeFormatter.Format(node.TotalAllocated)} on disk · {(node.IsDirectory ? "Folder" : "File")} · {fraction:P1} of this folder";
-            Brush chip = ChipBrushFor(node, _rankOf, _branchBrushes);
-            if (!_fileItemByNode.TryGetValue(node, out FileItemView? item))
-            {
-                item = new FileItemView(node, chip, normalTextBrush, normalTextBrush, tip);
-                _fileItemByNode[node] = item;
-            }
-            else
-            {
-                item.Refresh(chip, normalTextBrush, normalTextBrush, tip);
-            }
-            wanted.Add(item);
-        }
-
-        // DaisyDisk aggregated row: "smaller objects..." — one synthetic node reused across rebuilds.
-        if (aggregatedCount > 0 && query.Length == 0)
-        {
-            string aggTip = $"{aggregatedCount} smaller items totaling {SizeFormatter.Format(aggregatedBytes)}";
-            FileItemView agg;
-            if (_aggregatedItem is { } kept)
-            {
-                kept.Node.TotalAllocated = aggregatedBytes;
-                kept.Refresh(Palette.AggregatedBrush, dimTextBrush, dimTextBrush, aggTip);
-                agg = kept;
-            }
-            else
-            {
-                var aggNode = new FsNode
-                {
-                    Name = "smaller objects...",
-                    TotalAllocated = aggregatedBytes,
-                    Flags = NodeFlags.Directory,
-                };
-                agg = new FileItemView(aggNode, Palette.AggregatedBrush, dimTextBrush, dimTextBrush, aggTip, isAggregated: true);
-                _aggregatedItem = agg;
-            }
-            wanted.Add(agg);
-        }
-        else
-        {
-            _aggregatedItem = null;
-        }
-
-        // Bulk reconcile without O(n^2) IndexOf+Move: fast-path when already ordered,
-        // otherwise clear+add. The 150ms debounce coalesces typing.
-        bool inOrder = _fileItems.Count == wanted.Count;
-        if (inOrder)
-        {
-            for (int i = 0; i < wanted.Count; i++)
-                if (!ReferenceEquals(_fileItems[i], wanted[i])) { inOrder = false; break; }
-        }
-        if (!inOrder)
-        {
             _fileItems.Clear();
-            foreach (FileItemView item in wanted) _fileItems.Add(item);
-        }
-
-        // Drop lookup entries for nodes that left the view so the map cannot pin detached rows.
-        var byNode = new Dictionary<FsNode, FileItemView>(wanted.Count, ReferenceEqualityComparer.Instance);
-        foreach (FileItemView item in wanted)
-            if (!item.IsAggregated) byNode[item.Node] = item;
-        _fileItemByNode = byNode;
-
-        if (previouslySelected is not null && byNode.TryGetValue(previouslySelected, out FileItemView? restore))
-            ChildrenList.SelectedItem = restore;
-        if (_fileItems.Count == 0)
-        {
+            foreach (FileItemView row in wanted) _fileItems.Add(row);
+            _fileItemByNode = byNode;
+            if (selection is not null && byNode.TryGetValue(selection, out FileItemView? selected)) ChildrenList.SelectedItem = selected;
+            int first = page.MatchCount == 0 ? 0 : page.PageIndex * DirectoryPage.PageSize + 1;
+            int last = Math.Min(page.MatchCount, (page.PageIndex + 1) * DirectoryPage.PageSize);
+            ListResultCount.Text = $"{first:N0}–{last:N0} of {page.MatchCount:N0} {(query.Length > 0 ? "matches" : "items")}";
+            if (!showAll && query.Length == 0 && root.TotalAllocated > 0 && page.SmallerCount > 0)
+                ListResultCount.Text += $" · {page.TotalCount:N0} total";
+            PreviousPageButton.IsEnabled = page.PageIndex > 0;
+            NextPageButton.IsEnabled = page.PageIndex + 1 < page.PageCount;
+            ListPagingButtons.Visibility = page.PageCount > 1 ? Visibility.Visible : Visibility.Collapsed;
+            ShowAllItemsButton.Visibility = query.Length == 0 && page.SmallerCount > 0 && root.TotalAllocated > 0
+                ? Visibility.Visible : Visibility.Collapsed;
+            ShowAllItemsButton.Content = showAll ? "Group smaller items" : "Show all items";
             EmptyListText.Text = query.Length == 0 ? "This folder is empty" : $"No matches for \"{query}\"";
-            EmptyListText.Visibility = Visibility.Visible;
+            EmptyListText.Visibility = page.MatchCount == 0 ? Visibility.Visible : Visibility.Collapsed;
         }
-        else
-        {
-            EmptyListText.Visibility = Visibility.Collapsed;
-        }
+        catch (OperationCanceledException) { }
+    }
+
+    private void ShowAllItems(FsNode parent)
+    {
+        if (!ReferenceEquals(parent, _viewRoot)) NavigateInto(parent);
+        _filterDebounce.Stop();
+        ClearSearchFilter();
+        _showAllItems = true;
+        _pageIndex = 0;
+        RebuildFileList();
+    }
+
+    private void OnShowAllItemsClick(object sender, RoutedEventArgs e)
+    {
+        _showAllItems = !_showAllItems;
+        _pageIndex = 0;
+        RebuildFileList();
+    }
+
+    private void OnPreviousPageClick(object sender, RoutedEventArgs e)
+    {
+        _pageIndex = Math.Max(0, _pageIndex - 1);
+        RebuildFileList();
+    }
+
+    private void OnNextPageClick(object sender, RoutedEventArgs e)
+    {
+        _pageIndex++;
+        RebuildFileList();
     }
 
     private static Brush ChipBrushFor(FsNode node, IReadOnlyDictionary<FsNode, int> rankOf, Brush[] branchBrushes)
@@ -843,7 +833,6 @@ public partial class MainWindow : Window
 
         string kind = node.IsDirectory ? "Folder"
             : (node.Flags & NodeFlags.CloudPlaceholder) != 0 ? "Cloud placeholder"
-            : (node.Flags & NodeFlags.ReparsePoint) != 0 ? "Link"
             : (node.Flags & NodeFlags.Compressed) != 0 ? "Compressed file"
             : (node.Flags & NodeFlags.SparseFile) != 0 ? "Sparse file" : "File";
 
@@ -868,6 +857,7 @@ public partial class MainWindow : Window
         SearchPlaceholder.Visibility = string.IsNullOrEmpty(SearchBox.Text) ? Visibility.Visible : Visibility.Collapsed;
         ClearSearchButton.Visibility = string.IsNullOrEmpty(SearchBox.Text) ? Visibility.Collapsed : Visibility.Visible;
         if (!IsInitialized || _suppressFilterRebuild) return;
+        _pageIndex = 0;
         _filterDebounce.Stop();
         _filterDebounce.Start();
     }
@@ -907,7 +897,7 @@ public partial class MainWindow : Window
     private void OpenSelectedChild()
     {
         if (ChildrenList.SelectedItem is not FileItemView item) return;
-        if (item.IsAggregated) return;
+        if (item.IsAggregated) { if (_viewRoot is { } root) ShowAllItems(root); return; }
         if (item.Node.IsDirectory) NavigateInto(item.Node);
         else RevealInExplorer(item.Node);
     }
@@ -996,7 +986,7 @@ public partial class MainWindow : Window
         {
             // Burst handles Back itself (go up); a window-level Back here would navigate twice.
             if (Burst.IsKeyboardFocused || ReferenceEquals(Keyboard.FocusedElement, Burst)) return;
-            OnBackClick(sender, e);
+            NavigateUp();
             e.Handled = true;
             return;
         }
@@ -1034,7 +1024,7 @@ public partial class MainWindow : Window
     {
         if (!_scanner.IsScanning && _result is not null)
         {
-            StartScan(_result.Volume?.RootPath ?? _viewRoot?.GetPath() ?? "C:\\", _result.EngineName ?? "auto");
+            StartScan(_viewRoot?.GetPath() ?? _result.Root.GetPath(), "auto");
         }
     }
 
@@ -1116,27 +1106,6 @@ public partial class MainWindow : Window
                     UseShellExecute = true,
                 });
             }
-        }
-        catch { }
-    }
-
-    private void RequestElevatedRestart(string path)
-    {
-        string? executable = Environment.ProcessPath;
-        if (string.IsNullOrEmpty(executable)) return;
-        try
-        {
-            var start = new ProcessStartInfo
-            {
-                FileName = executable,
-                Verb = "runas",
-                UseShellExecute = true,
-            };
-            start.ArgumentList.Add("--scan");
-            start.ArgumentList.Add(path);
-            start.ArgumentList.Add("--fast");
-            Process.Start(start);
-            Application.Current.Shutdown();
         }
         catch { }
     }

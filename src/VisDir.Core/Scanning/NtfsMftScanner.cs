@@ -48,28 +48,39 @@ public sealed class NtfsMftScanner : IDiskScanner
         baseInfo.ReparseTag = ext.ReparseTag;
     }
 
-    // Parent-reference cycle probe (corrupt MFT): visited-set walk up at most 64 hops.
-    // Terminates at the root, a self-ref, or a missing parent; over-long chains count
-    // as acyclic so legit deep trees are never orphaned.
-    private static bool HasParentCycle(long recNo, Dictionary<long, MftEntryInfo> entries)
+    // Validate each directory once, including cycles longer than the former 64-hop cap.
+    private static HashSet<long> FindParentCycles(Dictionary<long, MftEntryInfo> entries, CancellationToken ct)
     {
-        Span<long> trail = stackalloc long[64];
-        int depth = 0;
-        long cur = recNo;
-        while (depth < 64)
+        var state = new Dictionary<long, byte>();
+        var cycles = new HashSet<long>();
+        var trail = new List<long>();
+        foreach ((long start, MftEntryInfo entry) in entries)
         {
-            for (int i = 0; i < depth; i++)
-                if (trail[i] == cur) return true;
-            trail[depth++] = cur;
-            if (!entries.TryGetValue(cur, out MftEntryInfo e)) return false;
-            long parent = unchecked((long)e.ParentRecordNumber);
-            if (parent == cur) return false;
-            if (parent == RootRecordNumber) return false;
-            cur = parent;
+            ct.ThrowIfCancellationRequested();
+            if (!entry.IsDirectory || state.ContainsKey(start)) continue;
+            trail.Clear();
+            long current = start;
+            while (current != RootRecordNumber && entries.TryGetValue(current, out MftEntryInfo info) && info.IsDirectory)
+            {
+                if (state.TryGetValue(current, out byte mark))
+                {
+                    if (mark == 1)
+                    {
+                        int beginning = trail.IndexOf(current);
+                        for (int i = beginning; i < trail.Count; i++) cycles.Add(trail[i]);
+                    }
+                    break;
+                }
+                state[current] = 1;
+                trail.Add(current);
+                long parent = (long)info.ParentRecordNumber;
+                if (parent == current) break;
+                current = parent;
+            }
+            foreach (long item in trail) state[item] = 2;
         }
-        return false;
+        return cycles;
     }
-
     public ScanResult Scan(ScanOptions options, CancellationToken cancellationToken, IProgress<ScanProgress>? progress)
     {
         TokenPrivilegeManager.TryEnableBackupPrivileges();
@@ -99,29 +110,45 @@ public sealed class NtfsMftScanner : IDiskScanner
 
             cancellationToken.ThrowIfCancellationRequested();
 
+            ValidateVolumeIdentity(capacity.VolumeSerialNumber, vol.VolumeSerialNumber);
+            capacity = capacity with { BytesPerCluster = vol.BytesPerCluster, VolumeSerialNumber = vol.VolumeSerialNumber, FileSystemName = "NTFS" };
+            var phases = new Dictionary<string, double>();
+            var phaseClock = Stopwatch.StartNew();
             Dictionary<long, MftEntryInfo> entries = ReadMft(hVolume, volumeDevice, in vol, cancellationToken, progress);
-            FsNode root = BuildTree(entries, capacity);
-            TreeOps.Finalize(root);
+            phases["ReadAndParse"] = phaseClock.Elapsed.TotalMilliseconds;
+            phaseClock.Restart();
+            progress?.Report(new ScanProgress(entries.Count, 0, 0, sw.Elapsed.TotalMilliseconds, 0.98, "Building directory tree"));
+            FsNode root = BuildTree(entries, capacity, cancellationToken);
 
             // The MFT read is always volume-wide; narrow the returned tree to the requested
             // subpath so callers see the same root contract as the compatible scanner.
             FsNode pruned = PruneToRequestedPath(root, requestedPath);
-            (long files, long dirs) = CountSubtree(pruned);
+            phases["Build"] = phaseClock.Elapsed.TotalMilliseconds;
+            phaseClock.Restart();
+            HardlinkAccounting.Apply(pruned, cancellationToken, onlyMarkedHardlinks: true);
+            TreeOps.Finalize(pruned, cancellationToken);
+            phases["Finalize"] = phaseClock.Elapsed.TotalMilliseconds;
+            (long files, long dirs, bool orphaned) = CountSubtree(pruned, cancellationToken);
 
             return new ScanResult
             {
-                Volume = capacity with
-                {
-                    BytesPerCluster = vol.BytesPerCluster,
-                    FileSystemName = "NTFS",
-                },
+                Volume = capacity,
                 Root = pruned,
                 EngineName = "mft",
+                Completeness = orphaned ? ScanCompleteness.Partial : ScanCompleteness.Complete,
+                Issues = orphaned
+                    ? new[] { new ScanIssue(requestedPath, "Some MFT records could not be placed in their original folders and are shown under [orphaned].") }
+                    : Array.Empty<ScanIssue>(),
+                AccountingFeatures = AccountingFeatures.UnnamedData | AccountingFeatures.NamedStreams
+                    | AccountingFeatures.DirectoryMetadata | AccountingFeatures.FileIdentity,
                 Stats = new ScanStats
                 {
                     FileCount = files,
                     DirectoryCount = dirs,
+                    ErrorCount = orphaned ? 1 : 0,
                     ElapsedMs = sw.Elapsed.TotalMilliseconds,
+                    BytesSeen = pruned.TotalAllocated,
+                    PhaseMs = phases,
                 },
             };
         }
@@ -129,6 +156,12 @@ public sealed class NtfsMftScanner : IDiskScanner
         {
             NativeMethods.CloseHandle(hVolume);
         }
+    }
+
+    internal static void ValidateVolumeIdentity(ulong requestedSerial, ulong rawSerial)
+    {
+        if (requestedSerial != 0 && requestedSerial != rawSerial)
+            throw new IOException("The requested folder belongs to a mounted volume; use the compatible scanner for this path.");
     }
 
     /// <summary>
@@ -164,21 +197,24 @@ public sealed class NtfsMftScanner : IDiskScanner
     }
 
     /// <summary>Single-pass file/directory count over a (possibly pruned) subtree.</summary>
-    private static (long Files, long Dirs) CountSubtree(FsNode root)
+    private static (long Files, long Dirs, bool Orphaned) CountSubtree(FsNode root, CancellationToken ct)
     {
         long files = 0, dirs = 0;
+        bool orphaned = false;
         var stack = new Stack<FsNode>();
         stack.Push(root);
         while (stack.Count > 0)
         {
+            ct.ThrowIfCancellationRequested();
             FsNode node = stack.Pop();
+            orphaned |= (node.Flags & NodeFlags.OrphanedRoot) != 0;
             if (node.IsDirectory) dirs++;
             else files++;
             if (node.Children is { } kids)
                 foreach (FsNode kid in kids)
                     stack.Push(kid);
         }
-        return (files, dirs);
+        return (files, dirs, orphaned);
     }
 
     public static string GetVolumeDevice(string normalizedRoot)
@@ -197,7 +233,10 @@ public sealed class NtfsMftScanner : IDiskScanner
         if (recordSize is < 512 or > 4096 || !int.IsPow2((int)recordSize))
             throw new IOException($"Unexpected MFT record size {recordSize}.");
 
-        ulong validLength = Math.Min(vol.MftValidDataLength, vol.TotalClusters * vol.BytesPerCluster);
+        ulong validLength = vol.MftValidDataLength;
+        if (vol.BytesPerCluster == 0 || validLength == 0 || validLength % recordSize != 0
+            || validLength > checked(vol.TotalClusters * vol.BytesPerCluster))
+            throw new IOException("Invalid MFT valid-data length.");
 
         // Size for the estimated live-record count so small volumes don't pay 1M slots
         // up front; sparse/deleted-heavy MFTs still grow naturally from here.
@@ -215,9 +254,8 @@ public sealed class NtfsMftScanner : IDiskScanner
         // Tier 1: open $MFT through the filesystem namespace — the kernel resolves
         // fragmentation/attribute-lists for us, so plain sequential reads suffice.
         // Backup semantics lets admin/backup-privileged callers past its restrictive ACL.
-        // OVERLAPPED allows the Tier-1 double-buffer below (chunk N+1 reads while N parses);
-        // synchronous fallback on the same handle stays correct when overlapped is unavailable.
-        // Tier 2 (fallback): decode $MFT record #0's run list from raw volume reads.
+        // OVERLAPPED allows the Tier-1 double-buffer below (chunk N+1 reads while N parses).
+        // Tier 2 resolves record zero and its attribute list through raw volume reads.
         IntPtr hMft = NativeMethods.CreateFileW(
             $"{volumeDevice}\\$MFT",
             NtfsNative.GenericRead, NtfsNative.ShareReadWriteDelete,
@@ -241,19 +279,26 @@ public sealed class NtfsMftScanner : IDiskScanner
                     uint usable = bytes - bytes % recordSize;
                     for (uint off = 0; off + recordSize <= usable; off += recordSize)
                     {
+                        if ((off & 0x003fffff) == 0) ct.ThrowIfCancellationRequested();
                         byte* rec = basePtr + off;
                         nSlots++;
-                        if (*rec != (byte)'F') continue; // unused/corrupt slot fast-path
+                        if (*rec != (byte)'F')
+                        {
+                            if ((*(ushort*)(rec + 0x16) & 1) != 0)
+                                throw new IOException($"Invalid in-use MFT signature at record {baseRecNo + off / recordSize}.");
+                            continue;
+                        }
                         nMagic++;
                         // Cheap pre-parse: the in-use flag sits at a fixed offset, so skip
                         // dead slots without walking attributes (post-parse check stays).
                         if (recordSize >= 0x18 && (*(ushort*)(rec + 0x16) & 1) == 0) { nNotInUse++; continue; }
 
-                        if (!NtfsRecordParser.TryParseRecord(rec, (int)recordSize, out MftEntryInfo info, out byte stage))
+                        if (!NtfsRecordParser.TryParseRecord(rec, (int)recordSize, out MftEntryInfo info, out byte stage)
+                            || info.Incomplete)
                         {
                             if (stage == NtfsRecordParser.FailFixup) nFixup++;
                             else if (stage == NtfsRecordParser.FailStructure) nStruct++;
-                            continue;
+                            throw new IOException($"Incomplete in-use MFT record {baseRecNo + off / recordSize} (parse stage {stage}).");
                         }
                         if (!info.InUse) { nNotInUse++; continue; }
 
@@ -273,7 +318,7 @@ public sealed class NtfsMftScanner : IDiskScanner
                         // so silent record replacement stays visible in MFTSTAT. Value wins,
                         // exactly as before — zero behavior change.
                         if (!entries.TryAdd(info.RecordNumber, info)) { entries[info.RecordNumber] = info; nDup++; }
-                        if (info.BaseRecordNumber != 0 && info.BaseRecordNumber != info.RecordNumber)
+                        if ((info.IsExtension || info.BaseRecordNumber != 0) && info.BaseRecordNumber != info.RecordNumber)
                         {
                             extensionRecNos.Add(info.RecordNumber);
                         }
@@ -299,149 +344,60 @@ public sealed class NtfsMftScanner : IDiskScanner
 
                 if (viaMftHandle)
                 {
-                    // Double-buffered overlapped Tier-1: chunk N+1 reads while N parses.
-                    // Falls back to the original synchronous loop when overlapped is unavailable;
-                    // Tier-2 (volume extents) below is untouched.
-                    bool pipelined = false;
-                    byte[]? buffer2 = null;
-                    try { buffer2 = GC.AllocateUninitializedArray<byte>(ReadBufferSize); }
-                    catch (OutOfMemoryException) { buffer2 = null; }
-
-                    if (buffer2 is not null)
+                    // RandomAccess owns the OVERLAPPED lifetime, including cancellation. Each
+                    // request has an explicit offset; the one-buffer path uses the same API.
+                    using var handle = new Microsoft.Win32.SafeHandles.SafeFileHandle(hMft, ownsHandle: false);
+                    using var reads = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                    byte[]? nextBuffer = null;
+                    try { nextBuffer = GC.AllocateUninitializedArray<byte>(ReadBufferSize); }
+                    catch (OutOfMemoryException) { /* one buffer still scans correctly */ }
+                    byte[] current = buffer;
+                    ulong offset = 0;
+                    Task<int>? pending = null;
+                    try
                     {
-                        fixed (byte* bufPtr2 = buffer2)
-                        {
-                            IntPtr evA = NtfsNative.CreateEventW(IntPtr.Zero, false, false, null);
-                            IntPtr evB = NtfsNative.CreateEventW(IntPtr.Zero, false, false, null);
-                            if (evA != IntPtr.Zero && evB != IntPtr.Zero)
-                            {
-                                try
-                                {
-                                    var ovA = new NtfsNative.OVERLAPPED { hEvent = evA };
-                                    var ovB = new NtfsNative.OVERLAPPED { hEvent = evB };
-                                    ulong fileOff = 0;
-                                    bool failed = false;
-                                    uint wantCur = (uint)Math.Min(validLength - fileOff, (uint)buffer.Length);
-                                    if (wantCur == 0)
-                                    {
-                                        pipelined = true;
-                                    }
-                                    else
-                                    {
-                                        byte* curPtr = bufPtr;
-                                        byte* nxtPtr = bufPtr2;
-                                        NtfsNative.OVERLAPPED* pCur = &ovA;
-                                        NtfsNative.OVERLAPPED* pNxt = &ovB;
-                                        int stCur;
-                                        uint immCur;
-                                        ct.ThrowIfCancellationRequested();
-                                        stCur = StartOverlappedRead(hMft, curPtr, wantCur, fileOff, pCur, out immCur);
-                                        if (stCur == 2)
-                                        {
-                                            failed = true;
-                                        }
-                                        else
-                                        {
-                                            fileOff += wantCur;
-                                            ulong curBase = fileOff - wantCur; // MFT-logical offset of curPtr
-                                            while (true)
-                                            {
-                                                uint gotCur;
-                                                if (!FinishOverlappedRead(hMft, pCur, stCur, immCur, out gotCur))
-                                                {
-                                                    failed = true;
-                                                    break;
-                                                }
-                                                ct.ThrowIfCancellationRequested();
-                                                if (gotCur == 0) break;
-                                                bool haveNext = false;
-                                                uint wantNxt = 0;
-                                                int stNxt = 0;
-                                                uint immNxt = 0;
-                                                ulong nxtBase = 0;
-                                                if (validLength - fileOff > 0)
-                                                {
-                                                    wantNxt = (uint)Math.Min(validLength - fileOff, (uint)buffer.Length);
-                                                    nxtBase = fileOff;
-                                                    stNxt = StartOverlappedRead(hMft, nxtPtr, wantNxt, fileOff, pNxt, out immNxt);
-                                                    if (stNxt == 2) failed = true;
-                                                    else { fileOff += wantNxt; haveNext = true; }
-                                                }
-                                                ParseBuffer(curPtr, gotCur, curBase);
-                                                ReportProgress(gotCur);
-                                                remaining -= Math.Min(remaining, gotCur);
-                                                if (gotCur < wantCur)
-                                                {
-                                                    // `want` is always clamped to `validLength - fileOff`, so a
-                                                    // short-of-want read is an anomaly, never a legitimate EOF
-                                                    // (at true EOF got == want and this never triggers). Flag it
-                                                    // so the synchronous resume below re-reads from
-                                                    // `bytesProcessed`; worst case that resume repeats bytes.
-                                                    failed = true;
-                                                    if (haveNext)
-                                                    {
-                                                        uint dummy;
-                                                        FinishOverlappedRead(hMft, pNxt, stNxt, immNxt, out dummy);
-                                                    }
-                                                    break;
-                                                }
-                                                if (!haveNext) break;
-                                                byte* tmpPtr = curPtr; curPtr = nxtPtr; nxtPtr = tmpPtr;
-                                                NtfsNative.OVERLAPPED* tmpOv = pCur; pCur = pNxt; pNxt = tmpOv;
-                                                wantCur = wantNxt; stCur = stNxt; immCur = immNxt; curBase = nxtBase;
-                                            }
-                                        }
-                                    }
-                                    if (!failed || remaining == 0) pipelined = true;
-                                }
-                                finally
-                                {
-                                    NativeMethods.CloseHandle(evA);
-                                    NativeMethods.CloseHandle(evB);
-                                }
-                            }
-                            else
-                            {
-                                if (evA != IntPtr.Zero) NativeMethods.CloseHandle(evA);
-                                if (evB != IntPtr.Zero) NativeMethods.CloseHandle(evB);
-                            }
-                        }
-                    }
-
-                    if (!pipelined)
-                    {
-                        // Synchronous resume: overlapped uses explicit offsets and never moves the
-                        // file pointer, so seek to the parsed offset before continuing linearly.
-                        if (bytesProcessed > 0)
-                        {
-                            if (!NtfsNative.SetFilePointerEx(hMft, (long)bytesProcessed, out _, 0))
-                                throw new Win32Exception(Marshal.GetLastWin32Error());
-                            remaining = validLength - Math.Min(validLength, bytesProcessed);
-                        }
-                        ulong syncBase = bytesProcessed; // MFT-logical offset of the next chunk
                         while (remaining > 0)
                         {
                             ct.ThrowIfCancellationRequested();
-                            uint want = (uint)Math.Min(remaining, (uint)buffer.Length);
-                            // `want` is clamped to `remaining`, so ReadFile-false/got==0 with
-                            // bytes left is an anomaly, never EOF (normal end exits via the
-                            // `remaining > 0` condition). Fail closed: the existing
-                            // MFT→generic fallback then produces a correct tree instead of a
-                            // silently partial one.
-                            if (!NtfsNative.ReadFile(hMft, bufPtr, want, out uint got, IntPtr.Zero) || got == 0)
-                                throw new IOException(
-                                    $"Short MFT read at offset {syncBase}: wanted {want}, got {got} (remaining {remaining}).");
-                            ParseBuffer(bufPtr, got, syncBase);
-                            syncBase += got;
-                            ReportProgress(got);
-                            remaining -= Math.Min(remaining, got);
+                            int want = (int)Math.Min(remaining, (uint)current.Length);
+                            int got = pending is not null
+                                ? pending.GetAwaiter().GetResult()
+                                : RandomAccess.ReadAsync(handle, current.AsMemory(0, want), checked((long)offset), reads.Token)
+                                    .AsTask().GetAwaiter().GetResult();
+                            pending = null;
+                            if (got != want)
+                                throw new IOException($"Incomplete MFT read at {offset}: expected {want}, received {got}.");
+                            ulong nextOffset = offset + (uint)got;
+                            ulong nextRemaining = remaining - (uint)got;
+                            if (nextBuffer is not null && nextRemaining > 0)
+                            {
+                                int nextWant = (int)Math.Min(nextRemaining, (uint)nextBuffer.Length);
+                                pending = RandomAccess.ReadAsync(handle, nextBuffer.AsMemory(0, nextWant),
+                                    checked((long)nextOffset), reads.Token).AsTask();
+                            }
+                            fixed (byte* currentPtr = current) ParseBuffer(currentPtr, (uint)got, offset);
+                            ReportProgress((uint)got);
+                            remaining = nextRemaining;
+                            offset = nextOffset;
+                            if (nextBuffer is not null) (current, nextBuffer) = (nextBuffer, current);
+                        }
+                    }
+                    finally
+                    {
+                        // Do not close the handle or release a buffer while its next read is pending.
+                        reads.Cancel();
+                        if (pending is not null)
+                        {
+                            try { pending.GetAwaiter().GetResult(); }
+                            catch (OperationCanceledException) { }
+                            catch (IOException) { }
                         }
                     }
                 }
                 else
                 {
                     List<(long StartLcn, ulong Clusters)> extents =
-                        DiscoverMftExtents(hVolume, in vol, validLength);
+                        DiscoverMftExtents(hVolume, in vol, validLength, ct);
 
                     ulong mftBase = 0; // MFT-logical offset across extents (volume pos differs)
                     foreach ((long lcn, ulong clusters) in extents)
@@ -459,7 +415,7 @@ public sealed class NtfsMftScanner : IDiskScanner
                             // `want` is clamped to `extentBytes`, so a failed/zero read with
                             // bytes left is an anomaly, never end-of-extent (normal end exits
                             // via `extentBytes > 0`). Fail closed like the Tier-1 resume.
-                            if (!NtfsNative.ReadFile(hVolume, bufPtr, want, out uint got, IntPtr.Zero) || got == 0)
+                            if (!NtfsNative.ReadFile(hVolume, bufPtr, want, out uint got, IntPtr.Zero) || got != want)
                             {
                                 throw new IOException(
                                     $"Short MFT extent read at volume offset {pos}: wanted {want}, got {got} (remaining {remaining}).");
@@ -475,6 +431,7 @@ public sealed class NtfsMftScanner : IDiskScanner
                     }
                 }
 
+                if (remaining != 0) throw new IOException($"Incomplete MFT scan: {remaining} bytes were not read.");
                 ReportProgress(0, flush: true); // final flush so the bar never sticks
             }
         }
@@ -490,7 +447,7 @@ public sealed class NtfsMftScanner : IDiskScanner
                 $"notInUse={nNotInUse} dup={nDup} kept={entries.Count}");
         }
 
-        MergeExtensionRecords(entries, extensionRecNos);
+        MergeExtensionRecords(entries, extensionRecNos, ct);
         ZeroBadClus(entries);
         return entries;
     }
@@ -511,34 +468,12 @@ public sealed class NtfsMftScanner : IDiskScanner
         }
     }
 
-    // Overlapped Tier-1 helpers: Start returns 0=sync-completed, 1=pending, 2=hard failure.
-    private static unsafe int StartOverlappedRead(
-        IntPtr h, byte* buf, uint want, ulong fileOffset, NtfsNative.OVERLAPPED* ov, out uint immediateGot)
-    {
-        ov->Internal = UIntPtr.Zero;
-        ov->InternalHigh = UIntPtr.Zero;
-        ov->Offset = (uint)(fileOffset & 0xFFFFFFFFUL);
-        ov->OffsetHigh = (uint)(fileOffset >> 32);
-        // hEvent is set once by the caller and preserved here.
-        if (NtfsNative.ReadFile(h, buf, want, out immediateGot, (IntPtr)ov))
-            return 0;
-        return Marshal.GetLastWin32Error() == NtfsNative.ErrorIoPending ? 1 : 2;
-    }
-
-    private static unsafe bool FinishOverlappedRead(
-        IntPtr h, NtfsNative.OVERLAPPED* ov, int started, uint immediateGot, out uint got)
-    {
-        if (started == 0) { got = immediateGot; return true; }
-        if (NtfsNative.WaitForSingleObject(ov->hEvent, NtfsNative.Infinite) != 0) { got = 0; return false; }
-        return NtfsNative.GetOverlappedResult(h, ov, out got, false);
-    }
-
     /// <summary>
     /// Records with a non-zero base reference are $ATTRIBUTE_LIST extensions of their base
     /// record (huge/fragmented files spill $DATA instances there, without a $FILE_NAME).
     /// Fold their sizes into the base so tree assembly sees one complete node per file.
     /// </summary>
-    internal static void MergeExtensionRecords(Dictionary<long, MftEntryInfo> entries, List<long> extensionRecNos)
+    internal static void MergeExtensionRecords(Dictionary<long, MftEntryInfo> entries, List<long> extensionRecNos, CancellationToken ct = default)
     {
         if (extensionRecNos.Count == 0) return;
         var removed = new HashSet<long>(extensionRecNos.Count);
@@ -550,13 +485,20 @@ public sealed class NtfsMftScanner : IDiskScanner
             // The lowest-VCN-zero record contains the complete primary-stream
             // allocation. Never add continuation records to it.
             baseInfo.DataAllocatedSize = Math.Max(baseInfo.DataAllocatedSize, ext.DataAllocatedSize);
-            baseInfo.AdsAllocatedSize += ext.AdsAllocatedSize;
-            baseInfo.IndexAllocationSize += ext.IndexAllocationSize;
+            baseInfo.AdsAllocatedSize = TreeOps.SaturatingAdd(baseInfo.AdsAllocatedSize, ext.AdsAllocatedSize);
+            baseInfo.IndexAllocationSize = TreeOps.SaturatingAdd(baseInfo.IndexAllocationSize, ext.IndexAllocationSize);
             baseInfo.Compressed |= ext.Compressed;
             baseInfo.Sparse |= ext.Sparse;
             baseInfo.HasPrimaryData |= ext.HasPrimaryData;
             baseInfo.Reparse |= ext.Reparse;
             baseInfo.Offline |= ext.Offline;
+            baseInfo.Incomplete |= ext.Incomplete;
+            if ((!baseInfo.HasFileName || baseInfo.NameRank <= 1) && ext.NameLinks is not null)
+                baseInfo.NameLinks = new List<MftNameInfo>(ext.NameLinks);
+            else if (ext.NameLinks is { } links)
+                foreach (MftNameInfo link in links) NtfsRecordParser.AddNameLink(ref baseInfo, link);
+            else if (ext.HasFileName && ext.NameRank > 1)
+                NtfsRecordParser.AddNameLink(ref baseInfo, new MftNameInfo(ext.ParentRecordNumber, ext.Name));
             // Adopt the better-ranked name across the fold boundary: a base holding
             // only a DOS-mangled name (seen live: base carries DOS-only $FILE_NAME
             // while WIN32 lives in an extension record) loses to a WIN32 extension.
@@ -574,8 +516,9 @@ public sealed class NtfsMftScanner : IDiskScanner
 
         foreach (long recNo in extensionRecNos)
         {
+            ct.ThrowIfCancellationRequested();
             if (!entries.TryGetValue(recNo, out MftEntryInfo ext)) continue;
-            if (ext.BaseRecordNumber == 0 || ext.BaseRecordNumber == recNo) continue;
+            if ((!ext.IsExtension && ext.BaseRecordNumber == 0) || ext.BaseRecordNumber == recNo) continue;
             if (!entries.TryGetValue(ext.BaseRecordNumber, out MftEntryInfo baseInfo)) continue;
             if (removed.Contains(ext.BaseRecordNumber)
                 || (baseInfo.BaseRecordNumber != 0 && baseInfo.BaseRecordNumber != ext.BaseRecordNumber))
@@ -595,6 +538,7 @@ public sealed class NtfsMftScanner : IDiskScanner
         {
             foreach (long recNo in deferred)
             {
+                ct.ThrowIfCancellationRequested();
                 if (removed.Contains(recNo)) continue;
                 if (!entries.TryGetValue(recNo, out MftEntryInfo ext)) continue;
                 long ultimate = ext.BaseRecordNumber;
@@ -617,44 +561,28 @@ public sealed class NtfsMftScanner : IDiskScanner
     }
 
     private static unsafe List<(long StartLcn, ulong Clusters)> DiscoverMftExtents(
-        IntPtr hVolume, in NtfsNative.NtfsVolumeDataBuffer vol, ulong validLength)
+        IntPtr hVolume, in NtfsNative.NtfsVolumeDataBuffer vol, ulong validLength, CancellationToken ct)
     {
-        if (vol.BytesPerCluster == 0)
-            throw new IOException("Invalid NTFS geometry: zero bytes per cluster.");
-        if (vol.MftStartLcn >= vol.TotalClusters)
-            throw new IOException(
-                $"Invalid MFT start LCN {vol.MftStartLcn} (total clusters {vol.TotalClusters}).");
-        ulong availClusters = vol.TotalClusters - vol.MftStartLcn; // >= 1 from the check above
-
-        uint recordSize = vol.BytesPerFileRecordSegment;
-        var probe = GC.AllocateUninitializedArray<byte>((int)recordSize * 8); // first few records
-
-        fixed (byte* p = probe)
+        uint sectorSize = Math.Max(vol.BytesPerSector, 512);
+        byte[] ReadPhysical(ulong offset, int length)
         {
-            if (!NtfsNative.SetFilePointerEx(hVolume, checked((long)(vol.MftStartLcn * vol.BytesPerCluster)), out _, 0))
-                throw new Win32Exception(Marshal.GetLastWin32Error());
-            if (!NtfsNative.ReadFile(hVolume, p, (uint)probe.Length, out uint got, IntPtr.Zero) || got < recordSize)
-                throw new IOException("Failed to read $MFT record 0.");
-
-            var extents = new List<(long, ulong)>();
-            // NOTE: TryDecodeDataRuns applies the update-sequence fixup itself; running a
-            // parser pass first would corrupt the sector-tail words and fail validation.
-            if (NtfsRecordParser.TryDecodeDataRuns(p, (int)recordSize, extents))
+            ct.ThrowIfCancellationRequested();
+            ulong alignedOffset = offset / sectorSize * sectorSize;
+            int prefix = checked((int)(offset - alignedOffset));
+            int alignedLength = checked((int)(((ulong)prefix + (uint)length + sectorSize - 1) / sectorSize * sectorSize));
+            byte[] bytes = GC.AllocateUninitializedArray<byte>(alignedLength);
+            fixed (byte* pointer = bytes)
             {
-                return extents;
+                if (!NtfsNative.SetFilePointerEx(hVolume, checked((long)alignedOffset), out _, 0)
+                    || !NtfsNative.ReadFile(hVolume, pointer, (uint)alignedLength, out uint got, IntPtr.Zero)
+                    || got != alignedLength)
+                    throw new IOException("Failed to read complete MFT extent metadata.");
             }
+            return prefix == 0 && length == alignedLength ? bytes : bytes.AsSpan(prefix, length).ToArray();
         }
-
-        // Degenerate fallback: treat the whole MFT as one contiguous span from its start
-        // LCN, clamped to the clusters that actually exist. Zero means nothing to read —
-        // return empty instead of forcing a past-the-end cluster.
-        ulong fallbackClusters = Math.Min(
-            (validLength + vol.BytesPerCluster - 1) / vol.BytesPerCluster,
-            availClusters);
-        if (fallbackClusters == 0) return new List<(long, ulong)>();
-        return new List<(long, ulong)> { ((long)vol.MftStartLcn, fallbackClusters) };
+        return MftExtentReader.Discover(ReadPhysical, vol.BytesPerCluster,
+            (int)vol.BytesPerFileRecordSegment, vol.MftStartLcn, vol.TotalClusters, validLength, ct);
     }
-
     private static readonly string[] SystemNames =
     {
         "$MFT", "$MFTMirr", "$LogFile", "$Volume", "$AttrDef", "", "$Bitmap", "$Boot",
@@ -662,7 +590,56 @@ public sealed class NtfsMftScanner : IDiskScanner
         "$Reserved14", "$Reserved15",
     };
 
-    private static FsNode BuildTree(Dictionary<long, MftEntryInfo> entries, VolumeInfo capacity)
+    internal static FsNode BuildTree(Dictionary<long, MftEntryInfo> entries, VolumeInfo capacity, CancellationToken ct = default)
+    {
+        if (!entries.TryGetValue(RootRecordNumber, out MftEntryInfo rootEntry) || !rootEntry.IsDirectory)
+            throw new IOException("The MFT does not contain a valid root directory.");
+        HashSet<long> cycles = FindParentCycles(entries, ct);
+        FsNode root = BuildTreeDense(entries, capacity, cycles, ct);
+        var directories = new Dictionary<ulong, FsNode>();
+        var stack = new Stack<FsNode>();
+        stack.Push(root);
+        FsNode? orphans = null;
+        while (stack.TryPop(out FsNode? node))
+        {
+            ct.ThrowIfCancellationRequested();
+            if ((node.Flags & NodeFlags.OrphanedRoot) != 0) orphans = node;
+            else if (node.IsDirectory) directories[(ulong)node.FileKey & 0x0000FFFFFFFFFFFFUL] = node;
+            if (node.Children is { } children)
+                foreach (FsNode child in children) if (child.IsDirectory) stack.Push(child);
+        }
+        foreach ((long recNo, MftEntryInfo entry) in entries)
+        {
+            ct.ThrowIfCancellationRequested();
+            if (entry.IsDirectory || entry.NameLinks is not { Count: > 1 } links) continue;
+            foreach (MftNameInfo link in links)
+            {
+                if (link.ParentRecordNumber == entry.ParentRecordNumber && link.Name == entry.Name) continue;
+                if (IsMountOrSymlinkTarget((long)link.ParentRecordNumber, entries)) continue;
+                if (!directories.TryGetValue(link.ParentRecordNumber, out FsNode? parent))
+                {
+                    if (orphans is null)
+                    {
+                        orphans = new FsNode { Name = "[orphaned]", Flags = NodeFlags.Directory | NodeFlags.OrphanedRoot };
+                        root.AddChild(orphans);
+                    }
+                    parent = orphans;
+                }
+                var alias = new FsNode
+                {
+                    Name = link.Name,
+                    FileKey = unchecked((long)(((ulong)entry.SequenceNumber << 48) | (ulong)recNo)),
+                    VolumeKey = capacity.VolumeSerialNumber,
+                };
+                ApplyInfo(alias, entry, capacity.BytesPerCluster);
+                alias.Flags |= NodeFlags.Hardlinked;
+                parent.AddChild(alias);
+            }
+        }
+        return root;
+    }
+
+    private static FsNode BuildTreeDense(Dictionary<long, MftEntryInfo> entries, VolumeInfo capacity, HashSet<long> cycles, CancellationToken ct)
     {
         // Single materialization: node refs live in one pooled record-keyed array instead of a
         // second Dictionary<long,FsNode>. Peak is entries-dict + array (8 B/slot, pooled),
@@ -671,7 +648,7 @@ public sealed class NtfsMftScanner : IDiskScanner
         foreach (long k in entries.Keys)
             if (k > maxRec) maxRec = k;
         if (maxRec < 0 || maxRec > int.MaxValue - 1 || maxRec > (long)entries.Count * 8L + 4096 || maxRec > 32_000_000L)
-            return BuildTreeSparse(entries, capacity);
+            return BuildTreeSparse(entries, capacity, cycles, ct);
 
         int size = (int)maxRec + 1;
         FsNode?[] slots = ArrayPool<FsNode?>.Shared.Rent(size);
@@ -682,6 +659,7 @@ public sealed class NtfsMftScanner : IDiskScanner
         {
             foreach ((long recNo, MftEntryInfo e) in entries)
             {
+                ct.ThrowIfCancellationRequested();
                 if (recNo < 0 || recNo >= size) continue; // defensive: rec nos are dense uints
                 bool isSystem = recNo < SystemRecordCount;
                 string name = e.HasFileName && e.Name.Length > 0 ? e.Name
@@ -690,7 +668,8 @@ public sealed class NtfsMftScanner : IDiskScanner
                 var node = new FsNode
                 {
                     Name = name,
-                    FileKey = recNo,
+                    FileKey = unchecked((long)(((ulong)e.SequenceNumber << 48) | (ulong)recNo)),
+                    VolumeKey = capacity.VolumeSerialNumber,
                 };
                 ApplyInfo(node, e, capacity.BytesPerCluster);
                 slots[(int)recNo] = node;
@@ -754,6 +733,7 @@ public sealed class NtfsMftScanner : IDiskScanner
             int rootCount = 0, orphanCount = 0;
             foreach (long recNo in entries.Keys)
             {
+                ct.ThrowIfCancellationRequested();
                 if (recNo == RootRecordNumber || recNo < 0 || recNo >= size) continue;
                 FsNode? target = ResolveTarget(recNo, slots, size, entries, root, orphans);
                 if (target is null) continue;
@@ -772,6 +752,7 @@ public sealed class NtfsMftScanner : IDiskScanner
 
             foreach (long recNo in entries.Keys)
             {
+                ct.ThrowIfCancellationRequested();
                 if (recNo == RootRecordNumber || recNo < 0 || recNo >= size) continue;
                 FsNode? node = slots[(int)recNo];
                 if (node is null || node.Parent is not null) continue;
@@ -779,7 +760,7 @@ public sealed class NtfsMftScanner : IDiskScanner
                 if (target is null) continue;
                 // Corrupt parent cycles would loop the tree forever: park them visibly.
                 if (!ReferenceEquals(target, root) && !ReferenceEquals(target, orphans)
-                    && HasParentCycle(recNo, entries))
+                    && cycles.Contains(recNo))
                     target = orphans;
                 target.AddChild(node);
             }
@@ -803,12 +784,13 @@ public sealed class NtfsMftScanner : IDiskScanner
     }
 
     // Sparse/deleted-heavy fallback: original dictionary materialization (rare; keeps behavior exact).
-    private static FsNode BuildTreeSparse(Dictionary<long, MftEntryInfo> entries, VolumeInfo capacity)
+    private static FsNode BuildTreeSparse(Dictionary<long, MftEntryInfo> entries, VolumeInfo capacity, HashSet<long> cycles, CancellationToken ct)
     {
         var nodes = new Dictionary<long, FsNode>(entries.Count);
 
         foreach ((long recNo, MftEntryInfo e) in entries)
         {
+            ct.ThrowIfCancellationRequested();
             bool isSystem = recNo < SystemRecordCount;
             string name = e.HasFileName && e.Name.Length > 0 ? e.Name
                 : isSystem && recNo >= 0 && SystemNames[(int)recNo].Length > 0 ? SystemNames[(int)recNo]
@@ -817,7 +799,8 @@ public sealed class NtfsMftScanner : IDiskScanner
             var node = new FsNode
             {
                 Name = name,
-                FileKey = recNo,
+                FileKey = unchecked((long)(((ulong)e.SequenceNumber << 48) | (ulong)recNo)),
+                    VolumeKey = capacity.VolumeSerialNumber,
             };
             ApplyInfo(node, e, capacity.BytesPerCluster);
             nodes[recNo] = node;
@@ -836,6 +819,7 @@ public sealed class NtfsMftScanner : IDiskScanner
 
         foreach ((long recNo, FsNode node) in nodes)
         {
+            ct.ThrowIfCancellationRequested();
             if (recNo == RootRecordNumber || node.Parent is not null) continue;
             MftEntryInfo e = entries[recNo];
 
@@ -857,7 +841,7 @@ public sealed class NtfsMftScanner : IDiskScanner
                     if (recNo >= SystemRecordCount) orphans.AddChild(node);
                     else root.AddChild(node);
                 }
-                else if (HasParentCycle(recNo, entries))
+                else if (cycles.Contains(recNo))
                 {
                     orphans.AddChild(node);
                 }
@@ -896,11 +880,13 @@ public sealed class NtfsMftScanner : IDiskScanner
     internal static void ApplyInfo(FsNode node, in MftEntryInfo e, uint clusterSize)
     {
         if (e.Reparse) node.Flags |= NodeFlags.ReparsePoint;
+        node.StreamAllocatedSize = e.AdsAllocatedSize;
+        node.MetadataAllocatedSize = e.IndexAllocationSize;
+        node.AllocatedSize = TreeOps.SaturatingAdd(TreeOps.SaturatingAdd(e.DataAllocatedSize, e.AdsAllocatedSize), e.IndexAllocationSize);
 
         if (e.IsDirectory)
         {
             node.Flags |= NodeFlags.Directory;
-            node.AllocatedSize = e.IndexAllocationSize; // directory index overhead
             node.LogicalSize = 0;
         }
         else
@@ -908,10 +894,8 @@ public sealed class NtfsMftScanner : IDiskScanner
             node.LogicalSize = e.LogicalSize;
             // Resident streams occupy the MFT record and require no separate clusters;
             // $MFT itself is represented in the tree and accounts for that storage.
-            node.AllocatedSize = e.DataAllocatedSize + e.AdsAllocatedSize;
             // System files like $Secure/$ObjId carry directory-index allocation
             // without being directories; count it so their storage isn't lost.
-            if (e.IndexAllocationSize > 0) node.AllocatedSize += e.IndexAllocationSize;
 
             if (e.Compressed) node.Flags |= NodeFlags.Compressed;
             if (e.Sparse) node.Flags |= NodeFlags.SparseFile;
@@ -923,9 +907,8 @@ public sealed class NtfsMftScanner : IDiskScanner
             if (e.Offline) node.Flags |= NodeFlags.CloudPlaceholder;
         }
 
-        // Hardlinks: sizes counted once at the canonical (first-seen) link location;
-        // extra links simply don't exist as separate nodes.
-        if (e.FileNameLinks > 1 && !e.IsDirectory) node.Flags |= NodeFlags.Hardlinked;
+        // All real names survive; shared accounting selects the owner within scan scope.
+        if ((e.FileNameLinks > 1 || e.NameLinks is { Count: > 1 }) && !e.IsDirectory) node.Flags |= NodeFlags.Hardlinked;
     }
 }
 

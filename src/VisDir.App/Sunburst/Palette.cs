@@ -187,22 +187,21 @@ public static class Palette
         return SKColor.FromHsl(hue, sat * 100f, Math.Clamp(light, 0.15f, 0.95f) * 100f);
     }
 
-    private static readonly Dictionary<(int BranchIndex, int BranchCount, int Depth), Brush> _brushCache = new();
-    private static readonly object _brushLock = new();
+    private const int MaximumCachedBrushes = 1024;
+    private static readonly Dictionary<(int Index, int Count, int Depth), Brush> BrushCache = new();
+    private static readonly object BrushLock = new();
 
-    /// <summary>
-    /// Frozen shared brush per (branch, count, depth). Frozen brushes are
-    /// free-threaded, so off-UI-thread layout rebuilds may call this safely.
-    /// </summary>
+    // Bound the shared cache; active projections retain their own frozen brush references.
     public static Brush BrushForBranch(int branchIndex, int branchCount, int depth = 1)
     {
-        var key = (branchIndex, branchCount, depth);
-        lock (_brushLock)
+        lock (BrushLock)
         {
-            if (_brushCache.TryGetValue(key, out Brush? cached)) return cached;
+            var key = (branchIndex, branchCount, depth);
+            if (BrushCache.TryGetValue(key, out Brush? cached)) return cached;
             SKColor sk = ColorForBranch(branchIndex, branchCount, depth, hovered: false);
             Brush brush = CreateFrozenBrush(sk.Red, sk.Green, sk.Blue);
-            _brushCache[key] = brush;
+            if (BrushCache.Count >= MaximumCachedBrushes) BrushCache.Clear();
+            BrushCache[key] = brush;
             return brush;
         }
     }

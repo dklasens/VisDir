@@ -90,6 +90,13 @@ jobs:
           Copy-Item artifacts/publish/win-x64/checksums-win-x64.sha256 release-files/
           Copy-Item artifacts/publish/win-arm64/checksums-win-arm64.sha256 release-files/
           Copy-Item artifacts/installer/*.msi release-files/
+          [xml] $props = Get-Content Directory.Build.props
+          $version = [string]$props.Project.PropertyGroup.VersionPrefix
+          $changelog = Get-Content CHANGELOG.md -Raw
+          $pattern = '(?ms)^## \[' + [regex]::Escape($version) + '\].*?(?=^## \[|\z)'
+          $notes = [regex]::Match($changelog, $pattern)
+          if (-not $notes.Success) { throw "Missing changelog entry for $version" }
+          $notes.Value.Trim() | Set-Content release-files/RELEASE_NOTES.md -Encoding utf8
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -113,6 +120,7 @@ jobs:
         with:
           tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
           generate_release_notes: true
+          body_path: release-files/RELEASE_NOTES.md
           draft: false
           prerelease: false
           files: |

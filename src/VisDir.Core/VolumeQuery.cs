@@ -47,6 +47,13 @@ public static class VolumeQuery
                             serial = serial32;
                         }
                     }
+                    // FILE_ID_INFO carries the full volume serial used by NTFS file references.
+                    // GetVolumeInformation's 32-bit serial alone cannot identify the same volume
+                    // consistently across the raw and directory-enumeration engines.
+                    Span<byte> identity = stackalloc byte[24];
+                    fixed (byte* pIdentity = identity)
+                        if (NativeMethods.GetFileInformationByHandleEx(hDir, 18, (IntPtr)pIdentity, 24))
+                            serial = *(ulong*)pIdentity;
                 }
             }
             finally { NativeMethods.CloseHandle(hDir); }

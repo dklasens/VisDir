@@ -32,7 +32,7 @@ public sealed class SafetyLimitException : Exception
 /// (FileIdExtdDirectoryInfo, downgrading to FileFullDirectoryInfo where unsupported).
 /// No elevation required, works on any filesystem Windows can enumerate.
 /// </summary>
-public sealed class GenericScanner : IDiskScanner
+public sealed class GenericScanner : IDiskScanner, IDisposable
 {
     private const int InitialBufferSize = 64 * 1024; // 64 KiB (avoids LOH; grows to MaxBufferSize on demand)
     private const int MaxBufferSize = 4 << 20;       // cap per-worker scratch at 4 MiB
@@ -52,12 +52,13 @@ public sealed class GenericScanner : IDiskScanner
     private long _bytesSeen;
     private volatile bool _braked;
     private long _snapshotTaken;
+    private readonly System.Collections.Concurrent.ConcurrentQueue<ScanIssue> _issues = new();
 
     private int _active;                 // outstanding directories (seeded with 1)
     private volatile bool _cancelled;
     // Per-volume extd-class enablement keyed by VolumeSerialNumber (0 = unknown).
     // One volume rejecting the class must not disable hardlink FileIds elsewhere.
-    private readonly System.Collections.Concurrent.ConcurrentDictionary<uint, bool> _extdByVolume = new();
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<ulong, bool> _extdByVolume = new();
     private readonly ThreadLocal<byte[]?> _buffer = new(() => null);
     private readonly ThreadLocal<LocalTally> _local = new(() => new LocalTally(), trackAllValues: true);
     // Placeholder compatibility is per-process: pin once per worker thread, ignore failure.
@@ -70,17 +71,6 @@ public sealed class GenericScanner : IDiskScanner
     private readonly ThreadLocal<Stack<List<FsNode>>> _listPool =
         new(() => new Stack<List<FsNode>>(4), trackAllValues: true);
 
-    // Hardlink dedup: same FileId reached via multiple directories counts allocated
-    // bytes once. FileId is only available from the extended info class (key==0 otherwise).
-    // Sharded by FileId hash so workers rarely contend on the same lock.
-    private const int DedupShards = 16;
-    private readonly System.Collections.Concurrent.ConcurrentDictionary<long, byte>[] _seenFileIds =
-        Enumerable.Range(0, DedupShards)
-            .Select(_ => new System.Collections.Concurrent.ConcurrentDictionary<long, byte>())
-            .ToArray();
-    // FileKeys seen more than once (batch-time, FileKey only). The deterministic
-    // post-join pass resolves these by (FileKey, LogicalSize) + lexicographic path.
-    private readonly System.Collections.Concurrent.ConcurrentDictionary<long, byte> _hardlinkDupKeys = new();
     // Reparse tag per directory node (reference key; reparse dirs are rare).
     // Lets Process skip only name-surrogate links (family 0xA0) while keeping the
     // ReparsePoint flag on all reparse points. Tag 0 = unknown (non-extd): skip.
@@ -110,7 +100,7 @@ public sealed class GenericScanner : IDiskScanner
         };
 
         var sw = Stopwatch.StartNew();
-        int threads = options.Threads > 0 ? Math.Min(options.Threads, 64) : Environment.ProcessorCount;
+        int threads = Math.Clamp(options.Threads > 0 ? options.Threads : Environment.ProcessorCount, 1, 64);
 
         var channel = Channel.CreateBounded<Item>(new BoundedChannelOptions(WorkQueueCapacity)
         {
@@ -121,7 +111,7 @@ public sealed class GenericScanner : IDiskScanner
 
         _active = 1;
         _dirsSeen = 1; // root
-        uint volSerial = (uint)volume.VolumeSerialNumber;
+        ulong volSerial = volume.VolumeSerialNumber;
         channel.Writer.TryWrite(new Item(volume.RootPath, root, 0, volSerial));
 
         var workers = new Task[threads];
@@ -132,11 +122,11 @@ public sealed class GenericScanner : IDiskScanner
         {
             while (!progressDone.Task.IsCompleted)
             {
-                try { await Task.Delay(250, cancellationToken).ConfigureAwait(false); }
+                try { await Task.WhenAny(Task.Delay(250, cancellationToken), progressDone.Task).ConfigureAwait(false); }
                 catch (OperationCanceledException) { break; }
-                ulong bytes = (ulong)Interlocked.Read(ref _bytesSeen);
-                ulong expected = volume.TotalBytes >= volume.FreeBytes ? volume.TotalBytes - volume.FreeBytes : 0;
-                double fraction = expected > 0 ? Math.Min(0.98, (double)bytes / expected) : -1;
+                if (progressDone.Task.IsCompleted || cancellationToken.IsCancellationRequested) break;
+                ulong bytes = (ulong)Math.Max(0, Interlocked.Read(ref _bytesSeen));
+                double fraction = -1; // Traversal has no trustworthy completion denominator.
                 progress.Report(new ScanProgress(
                     Interlocked.Read(ref _filesSeen),
                     Interlocked.Read(ref _dirsSeen),
@@ -172,11 +162,9 @@ public sealed class GenericScanner : IDiskScanner
         _filesSeen = files;
         _dirsSeen = dirs;
         _bytesSeen = bytes;
-        // Deterministic hardlink attribution: keep bytes on the lexicographically-first
-        // path per (FileKey, LogicalSize); zero losers so the root total stays stable
-        // regardless of worker arrival order. Must run before Finalize aggregates.
-        if (!_hardlinkDupKeys.IsEmpty)
-            _bytesSeen -= DeterminizeHardlinks(root);
+        double walkMs = sw.Elapsed.TotalMilliseconds;
+        HardlinkAccounting.Apply(root, cancellationToken);
+        double accountingMs = sw.Elapsed.TotalMilliseconds - walkMs;
         if (_braked)
             throw new SafetyLimitException(
                 $"Scan aborted: directory count exceeded safety limit ({MaxDirsSafetyLimit:N0}). " +
@@ -196,7 +184,8 @@ public sealed class GenericScanner : IDiskScanner
                 Console.Error.WriteLine($"ERRSAMPLE {s}");
         }
 
-        TreeOps.Finalize(root);
+        TreeOps.Finalize(root, cancellationToken);
+        _bytesSeen = (long)Math.Min(root.TotalAllocated, (ulong)long.MaxValue);
 
         var stats = new ScanStats
         {
@@ -205,11 +194,22 @@ public sealed class GenericScanner : IDiskScanner
             ErrorCount = Interlocked.Read(ref _errors),
             BytesSeen = (ulong)Interlocked.Read(ref _bytesSeen),
             ElapsedMs = sw.Elapsed.TotalMilliseconds,
+            PhaseMs = new Dictionary<string, double> { ["walk"] = walkMs, ["accounting"] = accountingMs, ["aggregate"] = sw.Elapsed.TotalMilliseconds - walkMs - accountingMs },
         };
-        return new ScanResult { Volume = volume, Root = root, Stats = stats, EngineName = "generic" };
+        return new ScanResult
+        {
+            Volume = volume,
+            Root = root,
+            Stats = stats,
+            EngineName = "generic",
+            Completeness = _errors == 0 ? ScanCompleteness.Complete : ScanCompleteness.Partial,
+            Issues = _issues.ToArray(),
+            AccountingFeatures = AccountingFeatures.UnnamedData |
+                (_extdByVolume.Values.All(enabled => enabled) ? AccountingFeatures.FileIdentity : AccountingFeatures.None),
+        };
     }
 
-    private readonly record struct Item(string Path, FsNode Node, int Depth, uint VolumeSerial);
+    private readonly record struct Item(string Path, FsNode Node, int Depth, ulong VolumeSerial);
 
     private void ResetState()
     {
@@ -222,9 +222,8 @@ public sealed class GenericScanner : IDiskScanner
         _cancelled = false;
         _snapshotTaken = 0;
         _extdByVolume.Clear();
-        foreach (var shard in _seenFileIds) shard.Clear();
-        _hardlinkDupKeys.Clear();
         _dirReparseTags.Clear();
+        while (_issues.TryDequeue(out _)) { }
         foreach (LocalTally t in _local.Values) t.Files = t.Dirs = t.Bytes = 0;
         _errorCounts.Clear();
         while (_errorSamples.TryDequeue(out _)) { }
@@ -285,17 +284,19 @@ public sealed class GenericScanner : IDiskScanner
         {
             RecordError("access_denied");
             Interlocked.Increment(ref _errors);
+            AddIssue(item.Path, "Access denied");
             item.Node.AddChild(new FsNode
             {
                 Name = "[access denied]",
                 Flags = NodeFlags.AccessDenied | NodeFlags.Directory,
             });
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is not OutOfMemoryException)
         {
             int code = ex is Win32Exception wex ? wex.NativeErrorCode : -1;
             RecordError($"{ex.GetType().Name}/{code}", item.Path);
             Interlocked.Increment(ref _errors);
+            AddIssue(item.Path, ex.Message);
             item.Node.AddChild(new FsNode
             {
                 Name = "[unreadable]",
@@ -323,7 +324,7 @@ public sealed class GenericScanner : IDiskScanner
         }
     }
 
-    private async Task Process(string dirPath, FsNode dirNode, int depth, uint volSerial, ChannelWriter<Item> writer, CancellationToken ct)
+    private async Task Process(string dirPath, FsNode dirNode, int depth, ulong volSerial, ChannelWriter<Item> writer, CancellationToken ct)
     {
         List<FsNode> children = Enumerate(dirPath, volSerial, ct);
         int childCount;
@@ -344,12 +345,19 @@ public sealed class GenericScanner : IDiskScanner
                 {
                     bool skip = true;
                     if (_dirReparseTags.TryRemove(child, out uint tag) && tag != 0)
-                        skip = (tag >> 24) == 0xA0;
+                        skip = (tag & 0x20000000) != 0;
+                    else
+                    {
+                        Interlocked.Increment(ref _errors);
+                        AddIssue(JoinDirFast(dirPath, child.Name), "Reparse directory type unavailable; not followed");
+                    }
                     if (skip) continue;
                 }
                 if (depth + 1 >= MaxDepth)
                 {
                     RecordError("max_depth", dirPath);
+                    Interlocked.Increment(ref _errors);
+                    AddIssue(JoinDirFast(dirPath, child.Name), "Directory depth limit reached");
                     continue;
                 }
 
@@ -419,7 +427,7 @@ public sealed class GenericScanner : IDiskScanner
     /// with the fallback info class. The capability downgrade (API rejects the class) is
     /// scoped per volume serial, but a shape-mismatch never poisons parsing for other directories.
     /// </summary>
-    private List<FsNode> Enumerate(string dirPath, uint volSerial, CancellationToken ct)
+    private List<FsNode> Enumerate(string dirPath, ulong volSerial, CancellationToken ct)
     {
         // Hoist the long-path prefix once per directory: both the initial attempt and any
         // fallback retry share one handle path, so Extend never runs per batch or per retry.
@@ -450,7 +458,7 @@ public sealed class GenericScanner : IDiskScanner
     }
 
     /// <summary>Enumerates one directory, returning fully-built child nodes.</summary>
-    private unsafe List<FsNode> EnumerateCore(string dirPath, string extendedPath, bool extdRequested, uint volSerial, CancellationToken ct)
+    private unsafe List<FsNode> EnumerateCore(string dirPath, string extendedPath, bool extdRequested, ulong volSerial, CancellationToken ct)
     {
         IntPtr hDir = NativeMethods.CreateFileW(
             extendedPath,
@@ -477,6 +485,8 @@ public sealed class GenericScanner : IDiskScanner
         // must not make us switch record layouts halfway through one enumeration.
         bool useExtd = extdRequested && ExtdEnabled(volSerial);
         bool owned = false;
+        LocalTally tally = _local.Value!;
+        long filesBefore = tally.Files, dirsBefore = tally.Dirs, bytesBefore = tally.Bytes;
 
         try
         {
@@ -525,11 +535,11 @@ public sealed class GenericScanner : IDiskScanner
                 int parsed;
                 fixed (byte* p = buf)
                 {
-                    parsed = ParseBatch(p, buf.Length, result, useExtd);
+                    parsed = ParseBatch(p, buf.Length, result, useExtd, volSerial);
                 }
 
                 if (parsed < 0) throw new CorruptBatchException();
-                if (parsed == 0) break; // defensive: no forward progress possible
+                // A batch containing only dot entries does not end enumeration.
 
             }
             owned = true;
@@ -538,13 +548,21 @@ public sealed class GenericScanner : IDiskScanner
         {
             NativeMethods.CloseHandle(hDir);
             // On failure the rented list stays pooled; on success ownership moves to the caller.
-            if (!owned) ReturnList(result);
+            if (!owned)
+            {
+                Interlocked.Add(ref _filesSeen, filesBefore - tally.Files);
+                Interlocked.Add(ref _dirsSeen, dirsBefore - tally.Dirs);
+                Interlocked.Add(ref _bytesSeen, bytesBefore - tally.Bytes);
+                tally.Files = filesBefore; tally.Dirs = dirsBefore; tally.Bytes = bytesBefore;
+                foreach (FsNode child in result) _dirReparseTags.TryRemove(child, out _);
+                ReturnList(result);
+            }
         }
 
         return result;
     }
 
-    private unsafe int ParseBatch(byte* basePtr, int bufferLength, List<FsNode> sink, bool extd)
+    private unsafe int ParseBatch(byte* basePtr, int bufferLength, List<FsNode> sink, bool extd, ulong volumeKey = 0)
     {
         int nameOffset = extd ? NativeMethods.Extd_FixedSize : NativeMethods.Full_FixedSize;
         int offLogical = extd ? NativeMethods.Extd_EndOfFile : NativeMethods.Full_EndOfFile;
@@ -575,115 +593,111 @@ public sealed class GenericScanner : IDiskScanner
         LocalTally tally = _local.Value!;
         long files0 = tally.Files, dirs0 = tally.Dirs, bytes0 = tally.Bytes;
 
-        while (cur + nameOffset <= end)
+        try
         {
-            uint next = *(uint*)cur;
-
-            // Strict structural validation — a violation means the batch does not match the
-            // assumed record layout. Return -1 so the caller can restart with the fallback class.
-            if ((next & 7) != 0) return -1;                                  // records are 8-byte aligned
-            if (next != 0 && (next < (uint)nameOffset + 2 || cur + next > end)) return -1;
-            if (next == 0 && cur + nameOffset > end) return -1;
-
-            uint nameBytes = *(uint*)(cur + offNameBytes);
-            if (nameBytes == 0 || (nameBytes & 1) != 0 || nameBytes > 65536) return -1; // never a legal name
-            if (cur + nameOffset + nameBytes > end) return -1;
-
-            char* namePtr = (char*)(cur + nameOffset);
-
-            // NT-level enumeration surfaces "." and ".." on many volumes; skip them
-            // before allocating anything.
-            bool isDotEntry =
-                (nameBytes == 2 && *namePtr == '.') ||
-                (nameBytes == 4 && namePtr[0] == '.' && namePtr[1] == '.');
-            if (isDotEntry)
+            while (cur + nameOffset <= end)
             {
-                if (next == 0) break;
-                cur += next;
-                continue;
-            }
+                uint next = *(uint*)cur;
 
-            long logical = *(long*)(cur + offLogical);
-            long allocated = *(long*)(cur + offAllocated);
-            long fileKey = extd ? *(long*)(cur + NativeMethods.Extd_FileId) : 0;
+                // Strict structural validation — a violation means the batch does not match the
+                // assumed record layout. Return -1 so the caller can restart with the fallback class.
+                if ((next & 7) != 0) return -1;                                  // records are 8-byte aligned
+                if (next != 0 && (next < (uint)nameOffset + 2 || cur + next > end)) return -1;
+                if (next == 0 && cur + nameOffset > end) return -1;
 
-            int nameLen = (int)(nameBytes / 2);
+                uint nameBytes = *(uint*)(cur + offNameBytes);
+                if (nameBytes == 0 || (nameBytes & 1) != 0 || nameBytes > 65536) return -1; // never a legal name
+                if (cur + nameOffset + nameBytes > end || (next != 0 && nameOffset + nameBytes > next)) return -1;
 
-            // Embedded NULs indicate we are reading a record with the wrong layout —
-            // never enqueue such names (they produce phantom paths downstream).
-            bool hasNul;
-            if (trustedExtd)
-            {
-                // Fast path: layout already validated once per batch, so a SIMD scan suffices.
-                hasNul = new ReadOnlySpan<char>(namePtr, nameLen).IndexOf('\0') >= 0;
-            }
-            else
-            {
-                hasNul = false;
-                for (int ci = 0; ci < nameLen; ci++)
+                char* namePtr = (char*)(cur + nameOffset);
+
+                // NT-level enumeration surfaces "." and ".." on many volumes; skip them
+                // before allocating anything.
+                bool isDotEntry =
+                    (nameBytes == 2 && *namePtr == '.') ||
+                    (nameBytes == 4 && namePtr[0] == '.' && namePtr[1] == '.');
+                if (isDotEntry)
                 {
-                    if (namePtr[ci] == '\0') { hasNul = true; break; }
+                    if (next == 0) break;
+                    cur += next;
+                    continue;
                 }
-            }
-            if (hasNul)
-            {
-                RecordError("nul_name", extd ? "extd" : "full");
-                if (next == 0) break;
+
+                long logical = *(long*)(cur + offLogical);
+                long allocated = *(long*)(cur + offAllocated);
+                long fileKey = extd ? *(long*)(cur + NativeMethods.Extd_FileId) : 0;
+
+                int nameLen = (int)(nameBytes / 2);
+
+                // Embedded NULs indicate we are reading a record with the wrong layout —
+                // never enqueue such names (they produce phantom paths downstream).
+                bool hasNul;
+                if (trustedExtd)
+                {
+                    // Fast path: layout already validated once per batch, so a SIMD scan suffices.
+                    hasNul = new ReadOnlySpan<char>(namePtr, nameLen).IndexOf('\0') >= 0;
+                }
+                else
+                {
+                    hasNul = false;
+                    for (int ci = 0; ci < nameLen; ci++)
+                    {
+                        if (namePtr[ci] == '\0') { hasNul = true; break; }
+                    }
+                }
+                if (hasNul)
+                {
+                    RecordError("nul_name", extd ? "extd" : "full");
+                    return -1;
+                }
+
+                var node = new FsNode
+                {
+                    LogicalSize = (ulong)Math.Max(0L, logical),
+                    AllocatedSize = (ulong)Math.Max(0L, allocated),
+                    FileKey = fileKey,
+                    FileKeyHigh = extd ? *(ulong*)(cur + NativeMethods.Extd_FileId + 8) : 0,
+                    VolumeKey = volumeKey,
+                    Name = new string(namePtr, 0, nameLen),
+                };
+
+                uint reparseTag = extd ? *(uint*)(cur + NativeMethods.Extd_ReparsePointTag) : 0;
+                bool isDir = ApplyAttributes(node, *(uint*)(cur + offAttributes), reparseTag);
+                if (isDir && (node.Flags & NodeFlags.ReparsePoint) != 0)
+                    _dirReparseTags[node] = reparseTag;
+
+                sink.Add(node);
+                count++;
+
+                // Per-entry accumulation is thread-local; one 64-bit mirror add per counter
+                // per batch keeps progress/brake readers live without per-file contention.
+                if (isDir)
+                    tally.Dirs++;
+                else
+                {
+                    tally.Files++;
+                    tally.Bytes += (long)node.AllocatedSize;
+                }
+
+                if (next == 0) break; // 0 marks the last entry in this batch
                 cur += next;
-                continue;
             }
-
-            var node = new FsNode
-            {
-                LogicalSize = (ulong)Math.Max(0L, logical),
-                AllocatedSize = (ulong)Math.Max(0L, allocated),
-                FileKey = fileKey,
-                Name = new string(namePtr, 0, nameLen),
-            };
-
-            uint reparseTag = extd ? *(uint*)(cur + NativeMethods.Extd_ReparsePointTag) : 0;
-            bool isDir = ApplyAttributes(node, *(uint*)(cur + offAttributes), reparseTag);
-            if (isDir && (node.Flags & NodeFlags.ReparsePoint) != 0)
-                _dirReparseTags[node] = reparseTag;
-
-            // Batch-time dup detection only marks; sizing is resolved deterministically
-            // post-join by lexicographic path so concurrent arrival order cannot move
-            // bytes between folders. Keep the real size here; DeterminizeHardlinks zeroes losers.
-            if (!isDir && fileKey != 0 &&
-                !_seenFileIds[(int)((uint)fileKey.GetHashCode() & (DedupShards - 1))].TryAdd(fileKey, 0))
-            {
-                node.Flags |= NodeFlags.Hardlinked;
-                _hardlinkDupKeys.TryAdd(fileKey, 0);
-            }
-
-            sink.Add(node);
-            count++;
-
-            // Per-entry accumulation is thread-local; one 64-bit mirror add per counter
-            // per batch keeps progress/brake readers live without per-file contention.
-            if (isDir)
-                tally.Dirs++;
-            else
-            {
-                tally.Files++;
-                tally.Bytes += (long)node.AllocatedSize;
-            }
-
-            if (next == 0) break; // 0 marks the last entry in this batch
-            cur += next;
+            return count;
         }
-        // Commit this batch's deltas once, so progress/brake readers stay live with
-        // O(1) atomics per batch instead of per entry. Final totals come from the
-        // join-time tally sum in Scan().
-        long dirs = Interlocked.Add(ref _dirsSeen, tally.Dirs - dirs0);
-        Interlocked.Add(ref _filesSeen, tally.Files - files0);
-        Interlocked.Add(ref _bytesSeen, tally.Bytes - bytes0);
-        if (dirs > MaxDirsSafetyLimit)
+        finally
         {
-            _braked = true;
-            _cancelled = true;
+            // Commit this batch's deltas once, so progress/brake readers stay live with
+            // O(1) atomics per batch instead of per entry. Final totals come from the
+            // join-time tally sum in Scan().
+            long dirs = Interlocked.Add(ref _dirsSeen, tally.Dirs - dirs0);
+            Interlocked.Add(ref _filesSeen, tally.Files - files0);
+            Interlocked.Add(ref _bytesSeen, tally.Bytes - bytes0);
+            if (dirs > MaxDirsSafetyLimit)
+            {
+                _braked = true;
+                _cancelled = true;
+            }
         }
-        return count;
     }
 
     /// <summary>
@@ -729,75 +743,17 @@ public sealed class GenericScanner : IDiskScanner
         return isDir;
     }
 
-    private bool ExtdEnabled(uint volSerial) =>
+    private bool ExtdEnabled(ulong volSerial) =>
         !_extdByVolume.TryGetValue(volSerial, out bool enabled) || enabled;
 
-    /// <summary>
-    /// Deterministic post-join hardlink resolution: groups file nodes by
-    /// (FileKey, LogicalSize) for keys known to collide, keeps AllocatedSize only on
-    /// the lexicographically-first full path, zeroes losers. Returns total bytes zeroed
-    /// so Scan can keep _bytesSeen consistent with the tree. Single-threaded (post-join).
-    /// LogicalSize must match to guard low-64 collisions on ReFS/SMB (FILE_ID_128 truncation).
-    /// </summary>
-    private long DeterminizeHardlinks(FsNode root)
+    private void AddIssue(string path, string reason)
     {
-        var groups = new Dictionary<(long Key, ulong Size), List<FsNode>>();
-        var stack = new Stack<FsNode>();
-        stack.Push(root);
-        while (stack.Count > 0)
-        {
-            FsNode n = stack.Pop();
-            var children = n.Children;
-            if (children is null) continue;
-            foreach (FsNode child in children)
-            {
-                if ((child.Flags & NodeFlags.Directory) != 0)
-                {
-                    stack.Push(child);
-                    continue;
-                }
-                if (child.FileKey == 0) continue;
-                if (!_hardlinkDupKeys.ContainsKey(child.FileKey)) continue;
-                var k = (child.FileKey, child.LogicalSize);
-                if (!groups.TryGetValue(k, out List<FsNode>? list))
-                    groups[k] = list = new List<FsNode>(2);
-                list.Add(child);
-            }
-        }
+        if (_issues.Count < 256) _issues.Enqueue(new ScanIssue(path, reason));
+    }
 
-        long zeroed = 0;
-        foreach (List<FsNode> members in groups.Values)
-        {
-            if (members.Count == 1)
-            {
-                // Spurious batch-time mark: same low-64 FileKey but no size match.
-                // Not a hardlink — clear the flag, keep the bytes.
-                members[0].Flags &= ~NodeFlags.Hardlinked;
-                continue;
-            }
-            FsNode? best = null;
-            string? bestPath = null;
-            foreach (FsNode m in members)
-            {
-                string p = m.GetPath();
-                if (best is null || string.CompareOrdinal(p, bestPath) < 0)
-                {
-                    best = m;
-                    bestPath = p;
-                }
-            }
-            foreach (FsNode m in members)
-            {
-                if (ReferenceEquals(m, best))
-                    m.Flags &= ~NodeFlags.Hardlinked;
-                else
-                {
-                    m.Flags |= NodeFlags.Hardlinked;
-                    zeroed += (long)m.AllocatedSize;
-                    m.AllocatedSize = 0;
-                }
-            }
-        }
-        return zeroed;
+    public void Dispose()
+    {
+        _buffer.Dispose(); _local.Dispose(); _placeholderModeSet.Dispose();
+        _pathBuilder.Dispose(); _listPool.Dispose();
     }
 }

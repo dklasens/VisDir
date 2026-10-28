@@ -3,6 +3,36 @@
 All notable changes to VisDir are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.2.8] - 2026-10-29
+
+### Accuracy and architecture
+
+- Resolve MFT attribute-list extents and reject incomplete reads or malformed in-use records; use cancellable asynchronous reads and report fallback reasons.
+- Preserve real hardlink aliases, full 128-bit file identities and 64-bit volume identities; share deterministic allocation attribution between engines and selected subfolder scopes.
+- Include directory alternate streams and distinguish stream and metadata allocation from ordinary data.
+- Centralize scanner selection and fallback in `ScanCoordinator`; publish immutable snapshots with completeness, diagnostics, and phase timings.
+- Add compact version 3 snapshots with version 2 read compatibility.
+- Compare every path bidirectionally in `--diff`, reconcile aggregate totals, and report partial/fallback verification as inconclusive.
+
+### Responsiveness and browsing
+
+- Fix large scans appearing stuck at "Loading results": batch snapshot writes without per-field flushes, buffer the complete pipe response, and show accurate loading percentages and counts.
+- Request administrator access once when the app opens, before showing the window; Automatic NTFS drive scans then use the direct MFT reader without a second UAC prompt. Cancelling startup UAC closes the app quietly.
+- Keep scanning in a separate worker process with inherited permissions, authenticated pipe transfer, and cancellation throughout loading and initial layout. Headless CLI and test workers do not prompt.
+- Prevent stale results from replacing newer scans and release scan/view caches together.
+- Bound chart rendering, including zero-byte cloud folders; page large lists and expose every filter match and smaller object.
+- Correct progress scaling and directory-overhead geometry; rescan the viewed folder and preserve navigation.
+- Query drives off the UI thread, bound brush caches, clarify keyboard navigation, and expose an Open in Explorer action.
+- Add end-to-end view timing logs and reproducible real-folder/synthetic pipeline benchmarks.
+
+### Update safety
+
+- Replace only manifest-owned files, preserve unrelated portable-installation content and locally modified originals, and roll back touched files after failed startup.
+
+### Validation
+
+- Add scanner extent/alias/accounting regressions, immutable snapshot and legacy-format checks, bounded UI and real WPF checks, broker process/cancellation tests, and updater preservation/rollback tests.
+
 ## [1.2.7] - 2026-09-09
 
 ### Fixed

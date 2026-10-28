@@ -111,6 +111,8 @@ public class SunburstControl : SkiaSharp.Views.WPF.SKElement
 
     public event Action<FsNode?>? HoveredChanged;
     public event Action<FsNode>? NodeClicked;
+    public event Action<FsNode>? NodeSelected;
+    public event Action<FsNode>? AggregateClicked;
     public event Action? CenterClicked;
 
     public SunburstControl()
@@ -121,6 +123,7 @@ public class SunburstControl : SkiaSharp.Views.WPF.SKElement
     private void DisposeRenderObjects()
     {
         CompositionTarget.Rendering -= OnAnimationTick;
+        ClearRenderCache();
         _strokePaint.Dispose();
         _legendTextPaint.Dispose();
         _legendTextFont.Dispose();
@@ -291,7 +294,7 @@ public class SunburstControl : SkiaSharp.Views.WPF.SKElement
             InvalidateVisual();
         }
 
-        Cursor = hit is { Depth: > 0, IsAggregatedWedge: false } ? Cursors.Hand
+        Cursor = hit is { Depth: > 0 } ? Cursors.Hand
             : isOverCenter && ViewRoot?.Parent is not null ? Cursors.Hand
             : Cursors.Arrow;
     }
@@ -311,15 +314,21 @@ public class SunburstControl : SkiaSharp.Views.WPF.SKElement
         }
 
         var hit = HitTestAt(p);
-        if (hit is not null && !hit.IsAggregatedWedge && hit.Depth > 0)
-            NodeClicked?.Invoke(hit.Source);
+        if (hit is { IsAggregatedWedge: true, AggregateSource: { } parent }) AggregateClicked?.Invoke(parent);
+        else if (hit is { Depth: > 0 }) NodeClicked?.Invoke(hit.Source);
     }
 
     protected override void OnKeyDown(KeyEventArgs e)
     {
         base.OnKeyDown(e);
+        if (e.Key == Key.Back)
+        {
+            CenterClicked?.Invoke();
+            e.Handled = true;
+            return;
+        }
         List<SunburstNode> choices = _visibleNodes
-            .Where(n => n.Depth > 0 && !n.IsAggregatedWedge)
+            .Where(n => n.Depth > 0)
             .ToList();
         if (choices.Count == 0) return;
 
@@ -350,7 +359,9 @@ public class SunburstControl : SkiaSharp.Views.WPF.SKElement
             case Key.Enter:
             case Key.Space:
                 if (_keyboardIndex < 0) _keyboardIndex = 0;
-                NodeClicked?.Invoke(choices[Math.Min(_keyboardIndex, choices.Count - 1)].Source);
+                SunburstNode chosen = choices[Math.Min(_keyboardIndex, choices.Count - 1)];
+                if (chosen is { IsAggregatedWedge: true, AggregateSource: { } parent }) AggregateClicked?.Invoke(parent);
+                else NodeClicked?.Invoke(chosen.Source);
                 e.Handled = true;
                 break;
             case Key.Back:
@@ -363,6 +374,7 @@ public class SunburstControl : SkiaSharp.Views.WPF.SKElement
     private void SelectKeyboardNode(SunburstNode node)
     {
         _selectedSource = node.Source;
+        if (!node.IsAggregatedWedge) NodeSelected?.Invoke(node.Source);
         SetHovered(node);
         AutomationProperties.SetName(this,
             $"Disk usage sunburst. Selected {node.DisplayName}, {SizeFormatter.Format(node.Source.TotalAllocated)}");
@@ -393,7 +405,7 @@ public class SunburstControl : SkiaSharp.Views.WPF.SKElement
         int index = -1;
         foreach (SunburstNode n in _visibleNodes)
         {
-            if (n.Depth <= 0 || n.IsAggregatedWedge) continue;
+            if (n.Depth <= 0) continue;
             index++;
             if (ReferenceEquals(n, node))
             {
@@ -415,12 +427,9 @@ public class SunburstControl : SkiaSharp.Views.WPF.SKElement
 
     private (double radius, double inner, double band, double ringW) GeometryDip()
     {
-        double w = Math.Max(ActualWidth, 1), h = Math.Max(ActualHeight, 1);
-        double maxR = Math.Min(w, h) / 2 * 0.88;
-        double inner = maxR * InnerRadiusFraction;
-        double band = (maxR - inner) / (MaxVisibleDepth + 1);
-        double ringW = band - Math.Max(2.5, maxR * 0.010);
-        return (maxR, inner, band, ringW);
+        double scale = VisualTreeHelper.GetDpi(this).DpiScaleX;
+        var g = GeometryFor((float)(Math.Max(ActualWidth, 1) * scale), (float)(Math.Max(ActualHeight, 1) * scale));
+        return (g.radius / scale, g.inner / scale, g.band / scale, g.ringW / scale);
     }
 
     private double RadiusFractionFromPoint(Point p)
@@ -536,10 +545,11 @@ public class SunburstControl : SkiaSharp.Views.WPF.SKElement
             _arcBySource[node.Source] = arc;
         }
 
-        if (ViewRoot is { Parent: null } viewRoot && Volume is { TotalBytes: > 0 } volume)
+        if (ViewRoot is { Parent: null } viewRoot && Volume is { TotalBytes: > 0 } volume &&
+            string.Equals(volume.RootPath.TrimEnd('\\'), System.IO.Path.GetPathRoot(volume.RootPath)?.TrimEnd('\\'), StringComparison.OrdinalIgnoreCase))
         {
-            ulong accounted = Math.Min(viewRoot.TotalAllocated, volume.TotalBytes);
-            ulong used = volume.TotalBytes >= volume.FreeBytes ? volume.TotalBytes - volume.FreeBytes : accounted;
+            ulong used = volume.TotalBytes >= volume.FreeBytes ? volume.TotalBytes - volume.FreeBytes : 0;
+            ulong accounted = Math.Min(viewRoot.TotalAllocated, used);
             ulong metadata = used > accounted ? used - accounted : 0;
             ulong free = volume.TotalBytes > used ? volume.TotalBytes - used : 0;
             float rMid = g.inner + g.ringW / 2;
@@ -548,6 +558,9 @@ public class SunburstControl : SkiaSharp.Views.WPF.SKElement
             AddCapacityArc(accounted, Palette.ScannedVolume, "Scanned");
             AddCapacityArc(metadata, Palette.MetadataWedge, "System & other");
             AddCapacityArc(free, Palette.FreeSpace, "Free");
+            if (viewRoot.TotalAllocated > used)
+                _legendItems.Add(new LegendItem(Palette.MetadataWedge,
+                    $"Scan exceeds volume usage by {SizeFormatter.Format(viewRoot.TotalAllocated - used)}"));
 
             void AddCapacityArc(ulong bytes, SKColor color, string label)
             {
