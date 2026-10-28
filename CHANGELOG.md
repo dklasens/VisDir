@@ -28,6 +28,7 @@ All notable changes to VisDir are documented here. Format follows
 ### Update safety
 
 - Replace only manifest-owned files, preserve unrelated portable-installation content and locally modified originals, and roll back touched files after failed startup.
+- Load Windows PowerShell's built-in signature-verification module explicitly so inherited PowerShell 7 module paths cannot break updates.
 
 ### Validation
 

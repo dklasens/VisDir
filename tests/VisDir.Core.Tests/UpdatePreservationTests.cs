@@ -8,10 +8,11 @@ namespace VisDir.Core.Tests;
 public sealed class UpdatePreservationTests
 {
     [Theory]
-    [InlineData(false, false)]
-    [InlineData(true, false)]
-    [InlineData(false, true)]
-    public void ManifestUpdate_PreservesUnownedFilesAndRollsBackFailures(bool startupFails, bool corruptPayload)
+    [InlineData(false, false, false)]
+    [InlineData(true, false, false)]
+    [InlineData(false, true, false)]
+    [InlineData(false, false, true)]
+    public void ManifestUpdate_PreservesUnownedFilesAndRollsBackFailures(bool startupFails, bool corruptPayload, bool foreignModulePath)
     {
         if (!OperatingSystem.IsWindows()) return;
         string operation = Guid.NewGuid().ToString("N");
@@ -62,7 +63,22 @@ public sealed class UpdatePreservationTests
                 : "\nInvoke-UpdateSwap";
             string harnessPath = Path.Combine(root, "harness.ps1");
             File.WriteAllText(harnessPath, harness);
-            RunPowerShell(harnessPath);
+            string? foreignModules = null;
+            if (foreignModulePath)
+            {
+                // A parent PowerShell 7 session can put incompatible modules ahead of
+                // Windows PowerShell's built-ins, as on GitHub's Windows runners.
+                foreignModules = Path.Combine(root, "foreign-modules");
+                Write(foreignModules, @"Microsoft.PowerShell.Security\Microsoft.PowerShell.Security.psd1",
+                    "@{ RootModule = 'broken.psm1'; ModuleVersion = '99.0.0'; FunctionsToExport = @('Get-AuthenticodeSignature') }");
+                Write(foreignModules, @"Microsoft.PowerShell.Security\broken.psm1",
+                    "function Get-AuthenticodeSignature { throw 'Incompatible inherited security module' }");
+                // Set inside the child as well: Windows PowerShell may reorder the
+                // inherited module path during its own initialization.
+                File.WriteAllText(harnessPath, "$env:PSModulePath = '" + Quote(foreignModules) +
+                    ";' + $env:PSModulePath\n" + harness);
+            }
+            RunPowerShell(harnessPath, foreignModules);
 
             Assert.Equal("user report", File.ReadAllText(Path.Combine(installed, "reports", "personal.txt")));
             Assert.Equal("unrelated program", File.ReadAllText(Path.Combine(installed, "other-app", "program.exe")));
@@ -94,7 +110,7 @@ public sealed class UpdatePreservationTests
         File.WriteAllLines(Path.Combine(root, "checksums-win-x64.sha256"), lines);
     }
 
-    private static void RunPowerShell(string path)
+    private static void RunPowerShell(string path, string? foreignModules = null)
     {
         var psi = new ProcessStartInfo(Path.Combine(Environment.SystemDirectory, "WindowsPowerShell", "v1.0", "powershell.exe"))
         {
@@ -103,6 +119,8 @@ public sealed class UpdatePreservationTests
         };
         foreach (string argument in new[] { "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", path })
             psi.ArgumentList.Add(argument);
+        if (foreignModules is not null)
+            psi.Environment["PSModulePath"] = foreignModules + Path.PathSeparator + Environment.GetEnvironmentVariable("PSModulePath");
         using Process process = Process.Start(psi)!;
         Task<string> stdout = process.StandardOutput.ReadToEndAsync();
         Task<string> stderr = process.StandardError.ReadToEndAsync();

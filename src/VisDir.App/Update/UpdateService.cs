@@ -789,12 +789,15 @@ function Test-UpdatePlan {
 function Test-StagedSignatures([string] $Dir) {
     # Bootstrap-consistent trust (mirrors C# VerifyStagedSignatures): unsigned installs
     # update on checksums-manifest integrity; the gate engages for signed ones.
+    # A PowerShell 7 parent can leave its incompatible Security module first in
+    # PSModulePath. Load this Windows PowerShell host's trusted built-in explicitly.
+    Import-Module (Join-Path $PSHOME 'Modules\Microsoft.PowerShell.Security\Microsoft.PowerShell.Security.psd1') -Force -ErrorAction Stop
     $runningExe = [System.IO.Path]::GetFullPath((Join-Path ([System.IO.Path]::GetFullPath([string]$plan.AppDir)) ([string]$plan.RelativeExe)))
     if (-not (Test-Path -LiteralPath $runningExe)) { return }
-    $self = Get-AuthenticodeSignature -LiteralPath $runningExe
+    $self = Microsoft.PowerShell.Security\Get-AuthenticodeSignature -LiteralPath $runningExe
     if ($self.Status -ne 'Valid') { return }
     foreach ($bin in @('VisDir.App.exe', 'VisDir.Scanner.dll')) {
-        $sig = Get-AuthenticodeSignature -LiteralPath (Join-Path $Dir $bin)
+        $sig = Microsoft.PowerShell.Security\Get-AuthenticodeSignature -LiteralPath (Join-Path $Dir $bin)
         if ($sig.Status -ne 'Valid') { throw ("Staged binary '{0}' failed Authenticode verification ({1})." -f $bin, $sig.Status) }
         $expected = ([string]$plan.ExpectedSignerThumbprint).Replace(' ', '').Replace("`t", '')
         if ($expected -ne '' -and $sig.SignerCertificate.Thumbprint -ne $expected) {
